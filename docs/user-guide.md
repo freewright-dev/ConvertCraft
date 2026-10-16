@@ -55,7 +55,7 @@ To reconvert a completed source, remove its row and add it again. Changing a com
 
 ### FFmpeg is missing or an encoder is unavailable
 
-Run `ffmpeg -version` in the launch environment and restart Transmute. A successful availability check does not guarantee that codecs such as `libx264`, `libvpx-vp9`, `libmp3lame`, `libvorbis`, or `libopus` are installed. Inspect `ffmpeg -encoders` if conversion reports a missing encoder. Audio extraction also requires an audio stream in the source.
+Run `ffmpeg -version` in the launch environment and restart ConvertCraft. A successful availability check does not guarantee that codecs such as `libx264`, `libvpx-vp9`, `libmp3lame`, `libvorbis`, or `libopus` are installed. Inspect `ffmpeg -encoders` if conversion reports a missing encoder. Audio extraction also requires an audio stream in the source.
 
 ### A file is skipped or fails to decode
 

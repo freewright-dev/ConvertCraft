@@ -1,6 +1,10 @@
-# Transmute
+<p align="center">
+  <img src="assets/logo.png" alt="ConvertCraft logo" width="200">
+</p>
 
-A local desktop file converter built with Rust and egui/eframe. This repository is named **ConvertCraft**; the application, Cargo package, and executable are named **Transmute** (`transmute`).
+# ConvertCraft
+
+A local desktop file converter built with Rust and egui/eframe. The application is named **ConvertCraft**; the Cargo package and executable currently retain the name `transmute`.
 
 Convert images, structured data, audio, and video in batches without uploading files to a service. Image and data conversions run in Rust; audio and video conversions use a locally installed FFmpeg.
 
@@ -30,7 +34,7 @@ For audio or video, install FFmpeg separately and make sure this works in the en
 ffmpeg -version
 ```
 
-Restart Transmute after changing `PATH`: FFmpeg availability is checked at startup. FFmpeg is optional for image and data conversions.
+Restart ConvertCraft after changing `PATH`: FFmpeg availability is checked at startup. FFmpeg is optional for image and data conversions.
 
 ## Supported conversions
 

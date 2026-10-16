@@ -12,16 +12,26 @@ use converter::{Category, Options};
 use eframe::egui::{self, Color32, RichText};
 
 fn main() -> eframe::Result {
+    let logo = image::load_from_memory(include_bytes!("../assets/logo.png"))
+        .expect("embedded logo must be a valid image")
+        .resize(256, 256, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    let icon = egui::IconData {
+        width: logo.width(),
+        height: logo.height(),
+        rgba: logo.into_raw(),
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Transmute")
+            .with_title("ConvertCraft")
+            .with_icon(icon)
             .with_inner_size([860.0, 580.0])
             .with_min_inner_size([620.0, 400.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
-        "Transmute",
+        "ConvertCraft",
         options,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
@@ -182,7 +192,7 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Transmute");
+            ui.heading("ConvertCraft");
             ui.separator();
             ui.add_enabled_ui(!self.running(), |ui| {
                 if ui.button("➕ Add files…").clicked() {

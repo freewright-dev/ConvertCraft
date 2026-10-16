@@ -6,7 +6,8 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Added
 
-- Transmute desktop interface built with egui/eframe.
+- ConvertCraft desktop interface built with egui/eframe (Cargo package: `transmute`).
+- Supplied logo embedded as the window icon and displayed in the README.
 - File selection, recursive folder import, drag-and-drop, and duplicate-path filtering.
 - Image conversion to PNG, JPG, WebP, BMP, GIF, TIFF, ICO, TGA, and QOI, including JPEG quality control and ICO resizing.
 - JSON, YAML, TOML, and CSV conversion, including CSV scalar inference and TOML wrapping for non-object roots.
