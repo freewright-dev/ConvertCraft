@@ -11,6 +11,8 @@ use std::thread;
 use converter::{Category, Options};
 use eframe::egui::{self, Color32, RichText};
 
+const APP_NAME: &str = "ConvertCraft";
+
 fn main() -> eframe::Result {
     let logo = image::load_from_memory(include_bytes!("../assets/logo.png"))
         .expect("embedded logo must be a valid image")
@@ -21,9 +23,13 @@ fn main() -> eframe::Result {
         height: logo.height(),
         rgba: logo.into_raw(),
     };
+    let logo = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ConvertCraft")
+            .with_title(APP_NAME)
             .with_icon(icon)
             .with_inner_size([860.0, 580.0])
             .with_min_inner_size([620.0, 400.0])
@@ -31,9 +37,9 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "ConvertCraft",
+        APP_NAME,
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, logo)))),
     )
 }
 
@@ -65,6 +71,7 @@ struct Job {
 }
 
 struct App {
+    logo: egui::TextureHandle,
     files: Vec<FileItem>,
     out_dir: Option<PathBuf>,
     opts: Options,
@@ -76,8 +83,9 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context, logo: egui::ColorImage) -> Self {
         Self {
+            logo: ctx.load_texture("convertcraft-logo", logo, egui::TextureOptions::LINEAR),
             files: Vec::new(),
             out_dir: None,
             opts: Options::default(),
@@ -192,8 +200,23 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("ConvertCraft");
-            ui.separator();
+            ui.image((self.logo.id(), egui::vec2(36.0, 36.0)));
+            ui.vertical(|ui| {
+                ui.heading(APP_NAME);
+                ui.label("Images, data, audio & video. Converted locally.");
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.ffmpeg {
+                    ui.label(RichText::new("ffmpeg ✔").color(Color32::from_rgb(90, 180, 110)))
+                        .on_hover_text("Audio and video conversion available");
+                } else {
+                    ui.label(RichText::new("ffmpeg missing").color(Color32::from_rgb(220, 160, 60)))
+                        .on_hover_text("Install ffmpeg and add it to PATH to convert audio and video");
+                }
+            });
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(!self.running(), |ui| {
                 if ui.button("➕ Add files…").clicked() {
                     if let Some(paths) = rfd::FileDialog::new().pick_files() {
@@ -211,15 +234,6 @@ impl App {
                 if ui.button("Clear all").clicked() {
                     self.files.clear();
                     self.skipped = 0;
-                }
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.ffmpeg {
-                    ui.label(RichText::new("ffmpeg ✔").color(Color32::from_rgb(90, 180, 110)))
-                        .on_hover_text("Audio and video conversion available");
-                } else {
-                    ui.label(RichText::new("ffmpeg missing").color(Color32::from_rgb(220, 160, 60)))
-                        .on_hover_text("Install ffmpeg and add it to PATH to convert audio and video");
                 }
             });
         });
@@ -272,15 +286,18 @@ impl App {
 
     fn file_list(&mut self, ui: &mut egui::Ui) {
         if self.files.is_empty() {
-            let response = ui.centered_and_justified(|ui| {
+            let response = ui.vertical_centered(|ui| {
+                ui.add_space(((ui.available_height() - 190.0) / 2.0).max(0.0));
+                ui.image((self.logo.id(), egui::vec2(96.0, 96.0)));
+                ui.add_space(12.0);
                 ui.add(
                     egui::Label::new(
                         RichText::new("Drop files or folders here\nor click to browse")
-                            .size(22.0)
-                            .weak(),
+                            .size(22.0),
                     )
                     .sense(egui::Sense::click()),
                 )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
             });
             if response.inner.clicked() {
                 if let Some(paths) = rfd::FileDialog::new().pick_files() {

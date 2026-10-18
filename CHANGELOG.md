@@ -4,9 +4,15 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ## Unreleased
 
+### Changed
+
+- Renamed the Cargo package and executable from `transmute` to `convertcraft`.
+- Replaced the logo with an orange-and-blue conversion-arrow mark, shared by the window icon, app header, empty queue, and README.
+- Separated branding from queue controls and rewrote the README with setup, workflow, supported formats, and conversion limitations.
+
 ### Added
 
-- ConvertCraft desktop interface built with egui/eframe (Cargo package: `transmute`).
+- ConvertCraft desktop interface built with egui/eframe.
 - Supplied logo embedded as the window icon and displayed in the README.
 - File selection, recursive folder import, drag-and-drop, and duplicate-path filtering.
 - Image conversion to PNG, JPG, WebP, BMP, GIF, TIFF, ICO, TGA, and QOI, including JPEG quality control and ICO resizing.
