@@ -128,3 +128,7 @@ For implementation details and extension guidance, read [Development and archite
 - [Development and architecture](docs/development.md)
 - [Changelog](CHANGELOG.md)
 - [Report an issue](https://github.com/openfield-labs/convertcraft/issues) — include your OS, source/target formats, and the error text; use non-sensitive sample files when possible.
+
+## License
+
+ConvertCraft is licensed under the [GNU General Public License v3.0](LICENSE).
