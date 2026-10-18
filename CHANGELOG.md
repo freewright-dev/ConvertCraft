@@ -25,10 +25,18 @@ This changelog records the current implementation. `Cargo.toml` declares version
 - Tests for image targets, structured data round trips, output-path collisions, and FFmpeg media conversions.
 - README and user, format, and development documentation.
 
+### Fixed
+
+- Enforce no-clobber when publishing new outputs, including files created after planning and case-only name collisions.
+- Preserve existing destinations when image/data encoding or FFmpeg fails; publish successful conversions from owned staging files.
+- Protect all queued source paths and file identities from overwrite-enabled batch outputs.
+- Report JPEG buffered-write failures before marking a job successful.
+- Isolate conversion test fixtures in unique temporary directories and surface output-directory creation errors.
+
 ### Known limitations
 
 - No cancellation, persistent settings, saved queue, or conversion command-line interface.
 - Media conversions require an external FFmpeg installation with the required codecs.
 - Image conversion uses a single decoded image rather than preserving animation.
 - Structured data conversion does not preserve comments, formatting, or every source-format type.
-- Output paths are checked and reserved within the batch, not atomically protected against other processes or filesystem path aliases.
+- Output publication is pathname-based; hostile ancestor-directory replacement in the final check-to-rename interval is not fully isolated.

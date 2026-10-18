@@ -19,11 +19,12 @@ The source includes Windows, macOS, and Unix file-manager integration. Platform-
 - `Cargo.toml`: package metadata and dependencies.
 - `Cargo.lock`: resolved dependency versions.
 - `src/main.rs`: native window, queue state, file import, controls, worker scheduling, progress, and file-manager integration.
-- `src/converter.rs`: extension/category detection, target defaults, output planning, image/data/media backends, and unit tests.
+- `src/converter.rs`: extension/category detection, target defaults, image/data/media backends, and unit tests.
+- `src/output.rs`: batch input identity protection, destination planning, staged output publication, and filesystem regression tests.
 - `assets/logos/`: current transparent logo (`logo.png`), light/dark previews (`logo-light.png`, `logo-dark.png`), and previous logo (`logo-original.png`). Only `logo.png` is embedded and shared by the window icon, app header, empty queue, and README. The UI texture is uploaded once at startup and retained by `App`.
 - `docs/`: user-facing behavior and developer reference.
 
-The project is a single binary crate with an internal `converter` module. It does not expose a library API, HTTP server, or conversion CLI.
+The project is a single binary crate with internal `converter` and `output` modules. It does not expose a library API, HTTP server, or conversion CLI.
 
 ## Dependencies
 
@@ -32,6 +33,7 @@ The project is a single binary crate with an internal `converter` module. It doe
 - `image`: image decoding, normalization, resizing, and encoding.
 - `serde_json`, `serde_yaml`, `toml`, `csv`: structured data parsing and serialization.
 - `anyhow`: backend errors with context.
+- `tempfile`, `same-file`: owned staging files/directories and filesystem identity checks.
 - Standard-library threads, channels, locks, and subprocesses: job execution and FFmpeg integration.
 
 ## Conversion lifecycle
@@ -44,9 +46,9 @@ The project is a single binary crate with an internal `converter` module. It doe
 
 ### Planning
 
-`App::start` ignores completed rows and marks media rows failed when FFmpeg was unavailable at startup. For each remaining row, `plan_output` chooses a source-adjacent or custom-directory path, adding numbered suffixes when needed.
+`App::start` first constructs an `OutputPlanner` protecting all queued inputs, including completed rows. It ignores completed rows for conversion and marks media rows failed when FFmpeg was unavailable at startup. For each remaining row, the planner chooses a source-adjacent or custom-directory path, adding numbered suffixes when needed, up to 10,000 attempts per job.
 
-A shared `HashSet<PathBuf>` reserves output names across the batch. The planner avoids the exact source path and, unless overwriting is enabled, existing destination paths. Reservations are lexical and batch-local: they do not detect all aliases or prevent races with external processes.
+The planner resolves parent directories, conservatively case-folds reserved names, and keeps source file-identity handles alive across the batch. It protects input paths and hard-link identities, skips destination links/reparse points and special files, and records the identity of any existing file selected for replacement. Failure to inspect/protect batch inputs stops scheduling and reports an error. Remove stale or inaccessible rows before retrying. Directory creation failures are also reported.
 
 ### Workers and UI updates
 
@@ -60,28 +62,31 @@ There are no cancellation tokens, explicit worker join handles, per-file progres
 
 ### Backend dispatch
 
-`convert` attempts to create the output parent directory and dispatches by category:
+`convert` consumes an `OutputPlan`, creates an owned staging directory on the output filesystem, and dispatches by category:
 
-- Images decode into `DynamicImage` and encode using the selected target.
-- Data passes through a `serde_json::Value` intermediate representation.
-- Audio/video invokes FFmpeg with fixed target-specific arguments.
+- Images decode into `DynamicImage` and encode to the open staging file, with checked buffer flushing (including JPEG).
+- Data passes through a `serde_json::Value` intermediate representation and writes to the open staging file.
+- Audio/video invokes FFmpeg with fixed target-specific arguments and a staged filename retaining the target extension.
 
-The backend's `convert` function does not call the output planner. Any future caller must plan or validate safe output paths itself. `Options::overwrite` is used by the UI's planning step; it is not enforced by image/data writers or the FFmpeg process.
+The planner captures overwrite policy in the plan; the backend cannot publish to an arbitrary destination path. Successful conversion returns the committed output path. All backends synchronize the staged file before publication. Failed conversion or publication drops staging files/directories and leaves previously published output intact.
 
-Files are written directly to their destinations, not through temporary files with atomic renames. FFmpeg failures attempt output cleanup; image/data failures do not provide equivalent cleanup.
+Publication uses `persist_noclobber` when no existing destination was selected, even if overwriting was enabled. If a file appears after planning, the job fails safely; retrying replans the name. Existing destinations selected for replacement are identity-checked again, then replaced atomically. Batch publication is serialized so aliases missed by case folding are rechecked after preceding commits. Output directory identity is checked before staging and publication.
+
+These pathname-based checks are not a capability sandbox: an attacker able to replace ancestor directories in the final check-to-rename interval can still race resolution. Existing-destination identity checking and replacement are not an OS-level compare-and-swap. Use trusted output directories; descriptor-relative publication for hostile directories remains follow-up hardening. File synchronization does not promise crash-durable directory entries on every filesystem, and forced termination may leave staging directories behind.
 
 ## Tests
 
-The four tests live in `src/converter.rs`:
+Tests live in `src/converter.rs` and `src/output.rs`:
 
 - `image_to_every_target`: generates a 300×200 RGBA image, converts it to every image target, and reopens each result.
 - `data_round_trips`: converts representative JSON rows to every data target and back, checking selected numeric/boolean values and accounting for the TOML `items` wrapper.
-- `output_paths_never_collide`: checks source-path avoidance and reservations for repeated output targets.
+- Filesystem regression tests cover late destination creation, competing publishers, batch source protection, case aliases, hard links, destination/directory replacement, staging cleanup, symbolic links, and aliased parent directories.
 - `media_via_ffmpeg`: generates a one-second video/audio fixture, converts every video target, then converts extracted WAV audio to every audio target.
+- Backend regressions verify sentinel preservation on malformed data/media and unsupported JPEG dimensions, successful replacement, cross-format batches, and propagation of buffered JPEG write errors.
 
 The media test returns early if FFmpeg is unavailable, so a passing `cargo test` alone does not prove media conversions ran. When FFmpeg is available, its build must include the required encoders and `lavfi` test sources.
 
-Tests write fixtures into a shared `converter-tests` directory under the OS temporary directory and do not clean them up. Separate simultaneous test runs can collide. There are no automated UI tests, platform integration tests, exhaustive malformed-input tests, or exhaustive data-fidelity checks.
+Each test owns a unique temporary directory that is cleaned up on completion. There are no automated UI tests, exhaustive malformed-input tests, or exhaustive data-fidelity checks. Platform behavior must be tested on the respective operating systems. On Windows, symlink tests print a skip diagnostic if Developer Mode/symlink privilege is unavailable; ensure a CI lane has this capability.
 
 ## Extending the converter
 
@@ -89,4 +94,4 @@ For a new recognized input extension, update `detect` and, if needed, `normalize
 
 Add tests for conversion and expected losses or failure cases, then update [formats.md](formats.md), the [README](../README.md), and [CHANGELOG.md](../CHANGELOG.md). Keep display branding consistent with `main.rs` and package naming consistent with `Cargo.toml`.
 
-For reliability improvements, pay particular attention to filesystem aliases and output races, atomic writes, symlink-aware traversal, worker panic/shutdown behavior, and preserving meaningful errors. These are limitations of the current implementation, not implemented guarantees.
+Further reliability work includes descriptor-relative operations in hostile directories, bounded/symlink-aware folder traversal, conversion resource limits, and worker panic/shutdown handling.

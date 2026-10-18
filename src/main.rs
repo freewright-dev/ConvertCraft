@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod converter;
+mod output;
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -65,7 +65,7 @@ enum Msg {
 struct Job {
     idx: usize,
     input: PathBuf,
-    output: PathBuf,
+    output: output::OutputPlan,
     category: Category,
     target: &'static str,
 }
@@ -127,7 +127,19 @@ impl App {
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        let mut reserved = HashSet::new();
+        let mut planner =
+            match output::OutputPlanner::new(self.files.iter().map(|file| file.path.as_path())) {
+                Ok(planner) => planner,
+                Err(error) => {
+                    for file in &mut self.files {
+                        if !matches!(file.status, Status::Done(_)) {
+                            file.status =
+                                Status::Failed(format!("cannot protect batch inputs: {error:#}"));
+                        }
+                    }
+                    return;
+                }
+            };
         let mut jobs = Vec::new();
         for (idx, f) in self.files.iter_mut().enumerate() {
             if matches!(f.status, Status::Done(_)) {
@@ -137,15 +149,26 @@ impl App {
                 f.status = Status::Failed("ffmpeg not found on PATH".into());
                 continue;
             }
-            let output = converter::plan_output(
+            let output = match planner.plan(
                 &f.path,
                 self.out_dir.as_deref(),
                 f.target,
                 self.opts.overwrite,
-                &mut reserved,
-            );
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    f.status = Status::Failed(format!("{error:#}"));
+                    continue;
+                }
+            };
             f.status = Status::Pending;
-            jobs.push(Job { idx, input: f.path.clone(), output, category: f.category, target: f.target });
+            jobs.push(Job {
+                idx,
+                input: f.path.clone(),
+                output,
+                category: f.category,
+                target: f.target,
+            });
         }
         if jobs.is_empty() {
             return;
@@ -156,22 +179,28 @@ impl App {
         jobs.reverse(); // workers pop from the end; keep list order
         let queue = Arc::new(Mutex::new(jobs));
         let (tx, rx) = mpsc::channel();
-        let workers = thread::available_parallelism().map_or(2, |n| n.get()).min(4);
+        let workers = thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .min(4);
 
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let tx = tx.clone();
             let ctx = ctx.clone();
             let opts = self.opts.clone();
-            thread::spawn(move || loop {
-                let Some(job) = queue.lock().unwrap().pop() else { break };
-                let _ = tx.send(Msg::Started(job.idx));
-                ctx.request_repaint();
-                let result = converter::convert(&job.input, &job.output, job.category, job.target, &opts)
-                    .map(|()| job.output)
-                    .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Msg::Finished(job.idx, result));
-                ctx.request_repaint();
+            thread::spawn(move || {
+                loop {
+                    let Some(job) = queue.lock().unwrap().pop() else {
+                        break;
+                    };
+                    let _ = tx.send(Msg::Started(job.idx));
+                    ctx.request_repaint();
+                    let result =
+                        converter::convert(&job.input, job.output, job.category, job.target, &opts)
+                            .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::Finished(job.idx, result));
+                    ctx.request_repaint();
+                }
             });
         }
         self.rx = Some(rx);
@@ -210,8 +239,10 @@ impl App {
                     ui.label(RichText::new("ffmpeg ✔").color(Color32::from_rgb(90, 180, 110)))
                         .on_hover_text("Audio and video conversion available");
                 } else {
-                    ui.label(RichText::new("ffmpeg missing").color(Color32::from_rgb(220, 160, 60)))
-                        .on_hover_text("Install ffmpeg and add it to PATH to convert audio and video");
+                    ui.label(
+                        RichText::new("ffmpeg missing").color(Color32::from_rgb(220, 160, 60)),
+                    )
+                    .on_hover_text("Install ffmpeg and add it to PATH to convert audio and video");
                 }
             });
         });
@@ -244,7 +275,10 @@ impl App {
         ui.add_enabled_ui(!self.running(), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Output:");
-                if ui.radio(self.out_dir.is_none(), "Next to source file").clicked() {
+                if ui
+                    .radio(self.out_dir.is_none(), "Next to source file")
+                    .clicked()
+                {
                     self.out_dir = None;
                 }
                 let label = match &self.out_dir {
@@ -266,10 +300,17 @@ impl App {
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let pending = self.files.iter().filter(|f| !matches!(f.status, Status::Done(_))).count();
+            let pending = self
+                .files
+                .iter()
+                .filter(|f| !matches!(f.status, Status::Done(_)))
+                .count();
             let button = egui::Button::new(RichText::new("Convert").size(16.0).strong())
                 .min_size(egui::vec2(120.0, 32.0));
-            if ui.add_enabled(!self.running() && pending > 0, button).clicked() {
+            if ui
+                .add_enabled(!self.running() && pending > 0, button)
+                .clicked()
+            {
                 self.start(ui.ctx());
             }
             if self.total > 0 {
@@ -292,8 +333,7 @@ impl App {
                 ui.add_space(12.0);
                 ui.add(
                     egui::Label::new(
-                        RichText::new("Drop files or folders here\nor click to browse")
-                            .size(22.0),
+                        RichText::new("Drop files or folders here\nor click to browse").size(22.0),
                     )
                     .sense(egui::Sense::click()),
                 )
@@ -332,90 +372,114 @@ impl App {
                         });
                 }
                 if self.skipped > 0 {
-                    ui.label(RichText::new(format!("({} unsupported files skipped)", self.skipped)).weak());
+                    ui.label(
+                        RichText::new(format!("({} unsupported files skipped)", self.skipped))
+                            .weak(),
+                    );
                 }
             });
         });
         ui.separator();
 
         let mut remove = None;
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("files")
-                .num_columns(5)
-                .striped(true)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.strong("File");
-                    ui.strong("Type");
-                    ui.strong("Convert to");
-                    ui.strong("Status");
-                    ui.label("");
-                    ui.end_row();
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                egui::Grid::new("files")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.strong("File");
+                        ui.strong("Type");
+                        ui.strong("Convert to");
+                        ui.strong("Status");
+                        ui.label("");
+                        ui.end_row();
 
-                    for (i, f) in self.files.iter_mut().enumerate() {
-                        let name = f.path.file_name().map_or_else(
-                            || f.path.display().to_string(),
-                            |n| n.to_string_lossy().into_owned(),
-                        );
-                        ui.label(name).on_hover_text(f.path.display().to_string());
-                        ui.label(f.category.label());
+                        for (i, f) in self.files.iter_mut().enumerate() {
+                            let name = f.path.file_name().map_or_else(
+                                || f.path.display().to_string(),
+                                |n| n.to_string_lossy().into_owned(),
+                            );
+                            ui.label(name).on_hover_text(f.path.display().to_string());
+                            ui.label(f.category.label());
 
-                        ui.add_enabled_ui(!running, |ui| {
-                            egui::ComboBox::from_id_salt(("target", i))
-                                .selected_text(f.target)
-                                .width(70.0)
-                                .show_ui(ui, |ui| {
-                                    for &t in f.category.targets() {
-                                        ui.selectable_value(&mut f.target, t, t);
+                            ui.add_enabled_ui(!running, |ui| {
+                                egui::ComboBox::from_id_salt(("target", i))
+                                    .selected_text(f.target)
+                                    .width(70.0)
+                                    .show_ui(ui, |ui| {
+                                        for &t in f.category.targets() {
+                                            ui.selectable_value(&mut f.target, t, t);
+                                        }
+                                    });
+                            });
+
+                            match &f.status {
+                                Status::Pending => {
+                                    ui.label(RichText::new("Pending").weak());
+                                }
+                                Status::Running => {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Converting…");
+                                    });
+                                }
+                                Status::Done(out) => {
+                                    let link =
+                                        ui.link(
+                                            RichText::new("Done")
+                                                .color(Color32::from_rgb(90, 180, 110)),
+                                        )
+                                        .on_hover_text(
+                                            format!("{}\nClick to show in folder", out.display()),
+                                        );
+                                    if link.clicked() {
+                                        reveal(out);
                                     }
-                                });
-                        });
-
-                        match &f.status {
-                            Status::Pending => {
-                                ui.label(RichText::new("Pending").weak());
-                            }
-                            Status::Running => {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("Converting…");
-                                });
-                            }
-                            Status::Done(out) => {
-                                let link = ui
-                                    .link(RichText::new("Done").color(Color32::from_rgb(90, 180, 110)))
-                                    .on_hover_text(format!("{}\nClick to show in folder", out.display()));
-                                if link.clicked() {
-                                    reveal(out);
+                                }
+                                Status::Failed(err) => {
+                                    ui.label(
+                                        RichText::new("Failed")
+                                            .color(Color32::from_rgb(220, 90, 90)),
+                                    )
+                                    .on_hover_text(err);
                                 }
                             }
-                            Status::Failed(err) => {
-                                ui.label(RichText::new("Failed").color(Color32::from_rgb(220, 90, 90)))
-                                    .on_hover_text(err);
-                            }
-                        }
 
-                        if ui.add_enabled(!running, egui::Button::new("✖").small()).clicked() {
-                            remove = Some(i);
+                            if ui
+                                .add_enabled(!running, egui::Button::new("✖").small())
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
-                    }
-                });
-        });
+                    });
+            });
         if let Some(i) = remove {
             self.files.remove(i);
         }
     }
 
     fn handle_drops(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<PathBuf> =
-            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
         if !self.running() {
             dropped.into_iter().for_each(|p| self.add_path(p));
         }
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop"),
+            ));
             let rect = ctx.screen_rect();
             painter.rect_filled(rect, 0.0, Color32::from_black_alpha(160));
             painter.text(
@@ -447,9 +511,14 @@ impl eframe::App for App {
 /// Open the system file manager with the converted file selected.
 fn reveal(path: &Path) {
     #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     if let Some(dir) = path.parent() {
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();

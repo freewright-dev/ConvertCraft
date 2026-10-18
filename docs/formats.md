@@ -107,9 +107,9 @@ These presets re-encode rather than requesting stream copying. There are no UI c
 The backend executes the equivalent of:
 
 ```text
-ffmpeg -y -hide_banner -loglevel error -i INPUT [target preset arguments] OUTPUT
+ffmpeg -y -hide_banner -loglevel error -i INPUT [target preset arguments] STAGED_OUTPUT
 ```
 
 Paths and options are passed as separate process arguments, not interpolated into a shell command. On Windows the subprocess uses `CREATE_NO_WINDOW`.
 
-The `-y` flag always permits FFmpeg to overwrite the planned output path. The application's output planner avoids existing paths when overwriting is disabled, but this is not an atomic filesystem guarantee. On nonzero exit, the backend attempts to delete the output and reports the last nonempty stderr line.
+The `-y` flag permits FFmpeg to write only its owned temporary output, whose suffix matches the target format. On nonzero exit, the backend reports the last nonempty stderr line and staging is cleaned up. The final destination is published after success through the same no-clobber/replacement policy as image and data conversions; failed input parsing does not delete an old destination.

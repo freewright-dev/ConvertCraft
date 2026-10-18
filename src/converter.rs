@@ -1,15 +1,16 @@
 //! Conversion backends: images (pure Rust), structured data (pure Rust),
 //! audio/video (delegated to an `ffmpeg` binary on PATH).
 
-use std::collections::HashSet;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, ImageFormat};
+use anyhow::{Context, Result, anyhow, bail};
+use image::{DynamicImage, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
 use serde_json::{Map, Value};
+
+use crate::output::OutputPlan;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Category {
@@ -20,7 +21,12 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 4] = [Category::Image, Category::Data, Category::Audio, Category::Video];
+    pub const ALL: [Category; 4] = [
+        Category::Image,
+        Category::Data,
+        Category::Audio,
+        Category::Video,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -33,10 +39,14 @@ impl Category {
 
     pub fn targets(self) -> &'static [&'static str] {
         match self {
-            Category::Image => &["png", "jpg", "webp", "bmp", "gif", "tiff", "ico", "tga", "qoi"],
+            Category::Image => &[
+                "png", "jpg", "webp", "bmp", "gif", "tiff", "ico", "tga", "qoi",
+            ],
             Category::Data => &["json", "yaml", "toml", "csv"],
             Category::Audio => &["mp3", "wav", "flac", "ogg", "m4a", "opus"],
-            Category::Video => &["mp4", "mkv", "webm", "avi", "mov", "gif", "mp3", "wav", "m4a"],
+            Category::Video => &[
+                "mp4", "mkv", "webm", "avi", "mov", "gif", "mp3", "wav", "m4a",
+            ],
         }
     }
 
@@ -54,8 +64,8 @@ pub fn extension(path: &Path) -> String {
 
 pub fn detect(path: &Path) -> Option<Category> {
     let cat = match extension(path).as_str() {
-        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tif" | "tiff" | "ico" | "tga" | "qoi"
-        | "pnm" | "pbm" | "pgm" | "ppm" => Category::Image,
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tif" | "tiff" | "ico" | "tga"
+        | "qoi" | "pnm" | "pbm" | "pgm" | "ppm" => Category::Image,
         "json" | "yaml" | "yml" | "toml" | "csv" => Category::Data,
         "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "opus" | "wma" | "aiff" | "aif" => {
             Category::Audio
@@ -96,71 +106,47 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { jpeg_quality: 90, overwrite: false }
-    }
-}
-
-/// Compute the output path, avoiding the input file itself, existing files
-/// (unless overwriting), and paths already reserved by other jobs in this batch.
-pub fn plan_output(
-    input: &Path,
-    out_dir: Option<&Path>,
-    target: &str,
-    overwrite: bool,
-    reserved: &mut HashSet<PathBuf>,
-) -> PathBuf {
-    let dir = out_dir
-        .map(Path::to_path_buf)
-        .or_else(|| input.parent().map(Path::to_path_buf))
-        .unwrap_or_default();
-    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-
-    let mut n = 0;
-    loop {
-        let name = if n == 0 {
-            format!("{stem}.{target}")
-        } else {
-            format!("{stem} ({n}).{target}")
-        };
-        let candidate = dir.join(name);
-        let taken = candidate == input
-            || reserved.contains(&candidate)
-            || (!overwrite && candidate.exists());
-        if !taken {
-            reserved.insert(candidate.clone());
-            return candidate;
+        Self {
+            jpeg_quality: 90,
+            overwrite: false,
         }
-        n += 1;
     }
 }
 
-pub fn convert(input: &Path, output: &Path, cat: Category, target: &str, opts: &Options) -> Result<()> {
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent).ok();
+pub fn convert(
+    input: &Path,
+    output: OutputPlan,
+    cat: Category,
+    target: &str,
+    opts: &Options,
+) -> Result<PathBuf> {
+    if !cat.targets().contains(&target) {
+        bail!("unsupported {} target: {target}", cat.label());
     }
+    let mut staged = output.begin()?;
     match cat {
-        Category::Image => convert_image(input, output, target, opts),
-        Category::Data => convert_data(input, output, target),
-        Category::Audio | Category::Video => convert_media(input, output, target),
+        Category::Image => convert_image(input, staged.file_mut(), target, opts)?,
+        Category::Data => convert_data(input, staged.file_mut(), target)?,
+        Category::Audio | Category::Video => convert_media(input, staged.path(), target)?,
     }
+    staged.commit()
 }
 
 // ---------------------------------------------------------------- images
 
-fn convert_image(input: &Path, output: &Path, target: &str, opts: &Options) -> Result<()> {
+fn convert_image(input: &Path, output: &mut File, target: &str, opts: &Options) -> Result<()> {
     let img = image::ImageReader::open(input)
         .context("cannot open image")?
         .with_guessed_format()?
         .decode()
         .context("cannot decode image")?;
 
+    let mut writer = BufWriter::new(output);
     match target {
         "jpg" => {
-            let file = BufWriter::new(File::create(output)?);
-            let mut enc = JpegEncoder::new_with_quality(file, opts.jpeg_quality);
-            enc.encode_image(&DynamicImage::ImageRgb8(img.to_rgb8()))?;
+            encode_jpeg(&img, &mut writer, opts.jpeg_quality)?;
         }
-        "png" => img.save_with_format(output, ImageFormat::Png)?,
+        "png" => img.write_to(&mut writer, ImageFormat::Png)?,
         _ => {
             let (format, img) = match target {
                 "ico" => {
@@ -181,15 +167,25 @@ fn convert_image(input: &Path, output: &Path, target: &str, opts: &Options) -> R
                 other => bail!("unsupported image target: {other}"),
             };
             // Most encoders only accept 8-bit RGBA; normalize to it.
-            DynamicImage::ImageRgba8(img.to_rgba8()).save_with_format(output, format)?;
+            DynamicImage::ImageRgba8(img.to_rgba8()).write_to(&mut writer, format)?;
         }
     }
+    writer.flush().context("cannot flush image output")?;
+    Ok(())
+}
+
+fn encode_jpeg(image: &DynamicImage, writer: &mut impl Write, quality: u8) -> Result<()> {
+    {
+        let mut encoder = JpegEncoder::new_with_quality(&mut *writer, quality);
+        encoder.encode_image(&DynamicImage::ImageRgb8(image.to_rgb8()))?;
+    }
+    writer.flush().context("cannot flush JPEG output")?;
     Ok(())
 }
 
 // ---------------------------------------------------------------- data
 
-fn convert_data(input: &Path, output: &Path, target: &str) -> Result<()> {
+fn convert_data(input: &Path, output: &mut File, target: &str) -> Result<()> {
     let text = std::fs::read_to_string(input).context("cannot read file")?;
     let value: Value = match normalize_ext(&extension(input)) {
         "json" => serde_json::from_str(&text).context("invalid JSON")?,
@@ -208,12 +204,13 @@ fn convert_data(input: &Path, output: &Path, target: &str) -> Result<()> {
                 Value::Object(_) => value,
                 other => Value::Object(Map::from_iter([("items".to_string(), other)])),
             };
-            toml::to_string_pretty(&value).context("data cannot be represented as TOML (nulls are not allowed)")?
+            toml::to_string_pretty(&value)
+                .context("data cannot be represented as TOML (nulls are not allowed)")?
         }
         "csv" => write_csv(&value)?,
         other => bail!("unsupported data target: {other}"),
     };
-    std::fs::write(output, out)?;
+    output.write_all(out.as_bytes())?;
     Ok(())
 }
 
@@ -256,7 +253,10 @@ fn write_csv(value: &Value) -> Result<String> {
     let rows: Vec<&Map<String, Value>> = match value {
         Value::Array(items) => items
             .iter()
-            .map(|v| v.as_object().ok_or_else(|| anyhow!("CSV needs an array of objects")))
+            .map(|v| {
+                v.as_object()
+                    .ok_or_else(|| anyhow!("CSV needs an array of objects"))
+            })
             .collect::<Result<_>>()?,
         Value::Object(map) => vec![map],
         _ => bail!("CSV needs an array of objects"),
@@ -318,16 +318,50 @@ fn ffmpeg_args(target: &str) -> &'static [&'static str] {
         "m4a" => &["-vn", "-c:a", "aac", "-b:a", "192k"],
         "opus" => &["-vn", "-c:a", "libopus", "-b:a", "128k"],
         "mp4" | "mov" => &[
-            "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
         ],
-        "mkv" => &["-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-b:a", "160k"],
-        "webm" => &["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-c:a", "libopus"],
-        "avi" => &["-c:v", "mpeg4", "-q:v", "5", "-c:a", "libmp3lame", "-q:a", "4"],
+        "mkv" => &[
+            "-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-b:a", "160k",
+        ],
+        "webm" => &[
+            "-c:v",
+            "libvpx-vp9",
+            "-crf",
+            "32",
+            "-b:v",
+            "0",
+            "-c:a",
+            "libopus",
+        ],
+        "avi" => &[
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "5",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "4",
+        ],
         "gif" => &[
-            "-an", "-vf",
+            "-an",
+            "-vf",
             "fps=12,scale='min(480,iw)':-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse",
-            "-loop", "0",
+            "-loop",
+            "0",
         ],
         _ => &[],
     }
@@ -349,9 +383,12 @@ fn convert_media(input: &Path, output: &Path, target: &str) -> Result<()> {
         Err(e) => return Err(e).context("failed to run ffmpeg"),
     };
     if !out.status.success() {
-        let _ = std::fs::remove_file(output);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let msg = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error");
+        let msg = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("unknown error");
         bail!("ffmpeg: {msg}");
     }
     Ok(())
@@ -360,22 +397,29 @@ fn convert_media(input: &Path, output: &Path, target: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::OutputPlanner;
 
-    fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("converter-tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+    fn convert_to(
+        input: &Path,
+        directory: &Path,
+        cat: Category,
+        target: &str,
+        opts: &Options,
+    ) -> Result<PathBuf> {
+        let mut planner = OutputPlanner::new([input])?;
+        let plan = planner.plan(input, Some(directory), target, opts.overwrite)?;
+        convert(input, plan, cat, target, opts)
     }
 
     #[test]
     fn image_to_every_target() {
-        let src = tmp("src.png");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.png");
         image::RgbaImage::from_fn(300, 200, |x, y| image::Rgba([x as u8, y as u8, 128, 200]))
             .save(&src)
             .unwrap();
         for &t in Category::Image.targets() {
-            let out = tmp(&format!("img-out.{t}"));
-            convert(&src, &out, Category::Image, t, &Options::default())
+            let out = convert_to(&src, dir.path(), Category::Image, t, &Options::default())
                 .unwrap_or_else(|e| panic!("{t}: {e:#}"));
             image::open(&out).unwrap_or_else(|e| panic!("reopen {t}: {e}"));
         }
@@ -383,15 +427,31 @@ mod tests {
 
     #[test]
     fn data_round_trips() {
-        let src = tmp("src.json");
-        std::fs::write(&src, r#"[{"name":"a","n":1,"ok":true},{"name":"b","n":2.5,"ok":false}]"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.json");
+        std::fs::write(
+            &src,
+            r#"[{"name":"a","n":1,"ok":true},{"name":"b","n":2.5,"ok":false}]"#,
+        )
+        .unwrap();
         for &t in Category::Data.targets() {
-            let out = tmp(&format!("data-out.{t}"));
-            convert(&src, &out, Category::Data, t, &Options::default())
-                .unwrap_or_else(|e| panic!("{t}: {e:#}"));
+            let out = convert_to(
+                &src,
+                &dir.path().join(t),
+                Category::Data,
+                t,
+                &Options::default(),
+            )
+            .unwrap_or_else(|e| panic!("{t}: {e:#}"));
             // Convert back to JSON and compare.
-            let back = tmp(&format!("data-back-{t}.json"));
-            convert(&out, &back, Category::Data, "json", &Options::default()).unwrap();
+            let back = convert_to(
+                &out,
+                &dir.path().join(format!("back-{t}")),
+                Category::Data,
+                "json",
+                &Options::default(),
+            )
+            .unwrap();
             let v: Value = serde_json::from_str(&std::fs::read_to_string(&back).unwrap()).unwrap();
             let rows = if t == "toml" { v["items"].clone() } else { v };
             assert_eq!(rows[1]["n"], 2.5, "{t}");
@@ -400,15 +460,109 @@ mod tests {
     }
 
     #[test]
-    fn output_paths_never_collide() {
-        let input = tmp("same.png");
-        std::fs::write(&input, b"x").unwrap();
-        let mut reserved = HashSet::new();
-        let a = plan_output(&input, None, "png", true, &mut reserved);
-        let b = plan_output(&input, None, "jpg", true, &mut reserved);
-        let c = plan_output(&input, None, "jpg", true, &mut reserved);
-        assert_ne!(a, input);
-        assert_ne!(b, c);
+    fn failed_jpeg_conversion_preserves_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("wide.png");
+        let output = dir.path().join("wide.jpg");
+        image::RgbImage::new(65_536, 1).save(&input).unwrap();
+        std::fs::write(&output, b"existing image").unwrap();
+        let opts = Options {
+            overwrite: true,
+            ..Options::default()
+        };
+        assert!(convert_to(&input, dir.path(), Category::Image, "jpg", &opts).is_err());
+        assert_eq!(std::fs::read(output).unwrap(), b"existing image");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn jpeg_flush_error_is_returned() {
+        struct FailedDisk;
+        impl Write for FailedDisk {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("simulated disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = BufWriter::new(FailedDisk);
+        let error = encode_jpeg(&DynamicImage::new_rgb8(1, 1), &mut writer, 90).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated disk full"));
+    }
+
+    #[test]
+    fn failed_data_conversion_preserves_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("invalid.json");
+        let output = dir.path().join("invalid.yaml");
+        std::fs::write(&input, b"{").unwrap();
+        std::fs::write(&output, b"previous data").unwrap();
+        let opts = Options {
+            overwrite: true,
+            ..Options::default()
+        };
+        assert!(convert_to(&input, dir.path(), Category::Data, "yaml", &opts).is_err());
+        assert_eq!(std::fs::read(output).unwrap(), b"previous data");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn successful_conversion_replaces_only_the_planned_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("data.json");
+        let output = dir.path().join("data.yaml");
+        std::fs::write(&input, r#"{"updated":true}"#).unwrap();
+        std::fs::write(&output, b"previous data").unwrap();
+        let opts = Options {
+            overwrite: true,
+            ..Options::default()
+        };
+        convert_to(&input, dir.path(), Category::Data, "yaml", &opts).unwrap();
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "updated: true\n");
+    }
+
+    #[test]
+    fn cross_format_batch_preserves_both_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("batch.json");
+        let yaml = dir.path().join("batch.yaml");
+        std::fs::write(&json, r#"{"origin":"A"}"#).unwrap();
+        std::fs::write(&yaml, "origin: B\n").unwrap();
+        let mut planner = OutputPlanner::new([json.as_path(), yaml.as_path()]).unwrap();
+        let json_plan = planner.plan(&json, None, "yaml", true).unwrap();
+        let yaml_plan = planner.plan(&yaml, None, "json", true).unwrap();
+        let opts = Options {
+            overwrite: true,
+            ..Options::default()
+        };
+        let a = convert(&json, json_plan, Category::Data, "yaml", &opts).unwrap();
+        let b = convert(&yaml, yaml_plan, Category::Data, "json", &opts).unwrap();
+        assert_eq!(std::fs::read_to_string(json).unwrap(), r#"{"origin":"A"}"#);
+        assert_eq!(std::fs::read_to_string(yaml).unwrap(), "origin: B\n");
+        assert_eq!(std::fs::read_to_string(a).unwrap(), "origin: A\n");
+        let converted: Value = serde_json::from_str(&std::fs::read_to_string(b).unwrap()).unwrap();
+        assert_eq!(converted, serde_json::json!({"origin": "B"}));
+    }
+
+    #[test]
+    fn failed_ffmpeg_conversion_preserves_existing_output() {
+        if !ffmpeg_available() {
+            eprintln!("skipping FFmpeg failure test: ffmpeg is unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("broken.mp4");
+        let output = dir.path().join("broken.wav");
+        std::fs::write(&input, b"not a media file").unwrap();
+        std::fs::write(&output, b"previous audio").unwrap();
+        let opts = Options {
+            overwrite: true,
+            ..Options::default()
+        };
+        assert!(convert_to(&input, dir.path(), Category::Video, "wav", &opts).is_err());
+        assert_eq!(std::fs::read(output).unwrap(), b"previous audio");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -416,26 +570,49 @@ mod tests {
         if !ffmpeg_available() {
             return;
         }
-        let src = tmp("src.mp4");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.mp4");
         let ok = ffmpeg_command()
-            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=15",
-                   "-f", "lavfi", "-i", "sine=duration=1", "-shortest"])
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=15",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+                "-shortest",
+            ])
             .arg(&src)
             .status()
             .unwrap()
             .success();
         assert!(ok);
         for &t in Category::Video.targets() {
-            let out = tmp(&format!("vid-out.{t}"));
-            convert(&src, &out, Category::Video, t, &Options::default())
-                .unwrap_or_else(|e| panic!("{t}: {e:#}"));
+            let out = convert_to(
+                &src,
+                &dir.path().join("video"),
+                Category::Video,
+                t,
+                &Options::default(),
+            )
+            .unwrap_or_else(|e| panic!("{t}: {e:#}"));
             assert!(std::fs::metadata(&out).unwrap().len() > 0, "{t}");
         }
-        let wav = tmp("vid-out.wav");
+        let wav = dir.path().join("video/src.wav");
         for &t in Category::Audio.targets() {
-            let out = tmp(&format!("aud-out.{t}"));
-            convert(&wav, &out, Category::Audio, t, &Options::default())
-                .unwrap_or_else(|e| panic!("{t}: {e:#}"));
+            convert_to(
+                &wav,
+                &dir.path().join("audio"),
+                Category::Audio,
+                t,
+                &Options::default(),
+            )
+            .unwrap_or_else(|e| panic!("{t}: {e:#}"));
         }
     }
 }

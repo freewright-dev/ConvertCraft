@@ -812,8 +812,10 @@ dependencies = [
  "eframe",
  "image",
  "rfd",
+ "same-file",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "toml",
 ]
 
