@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="ConvertCraft — orange and blue conversion arrows forming a C" width="160" height="160">
+  <img src="assets/logos/logo.png" alt="ConvertCraft — orange and blue conversion arrows forming a C" width="160" height="160">
 </p>
 
 <h1 align="center">ConvertCraft</h1>
@@ -114,7 +114,7 @@ The existing tests exercise image targets, structured data round trips, output-p
 | --- | --- |
 | [`src/main.rs`](src/main.rs) | Native UI, queue, worker scheduling, progress, and file-manager integration |
 | [`src/converter.rs`](src/converter.rs) | Format detection, output planning, conversion backends, and tests |
-| [`assets/logo.png`](assets/logo.png) | Shared logo for the window icon, app header, empty queue, and README |
+| [`assets/logos/`](assets/logos/) | Current transparent logo (`logo.png`), light/dark previews, and previous logo (`logo-original.png`) |
 | [`docs/`](docs/README.md) | User guide, format details, and architecture |
 
 The window title and in-app name use `APP_NAME` in `src/main.rs`. The embedded logo is decoded once at startup and reused for the native icon and UI texture; no external asset folder is needed beside the compiled executable.

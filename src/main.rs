@@ -14,7 +14,7 @@ use eframe::egui::{self, Color32, RichText};
 const APP_NAME: &str = "ConvertCraft";
 
 fn main() -> eframe::Result {
-    let logo = image::load_from_memory(include_bytes!("../assets/logo.png"))
+    let logo = image::load_from_memory(include_bytes!("../assets/logos/logo.png"))
         .expect("embedded logo must be a valid image")
         .resize(256, 256, image::imageops::FilterType::Lanczos3)
         .into_rgba8();

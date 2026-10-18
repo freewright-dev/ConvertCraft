@@ -20,7 +20,7 @@ The source includes Windows, macOS, and Unix file-manager integration. Platform-
 - `Cargo.lock`: resolved dependency versions.
 - `src/main.rs`: native window, queue state, file import, controls, worker scheduling, progress, and file-manager integration.
 - `src/converter.rs`: extension/category detection, target defaults, output planning, image/data/media backends, and unit tests.
-- `assets/logo.png`: embedded brand mark shared by the window icon, app header, empty queue, and README. The UI texture is uploaded once at startup and retained by `App`.
+- `assets/logos/`: current transparent logo (`logo.png`), light/dark previews (`logo-light.png`, `logo-dark.png`), and previous logo (`logo-original.png`). Only `logo.png` is embedded and shared by the window icon, app header, empty queue, and README. The UI texture is uploaded once at startup and retained by `App`.
 - `docs/`: user-facing behavior and developer reference.
 
 The project is a single binary crate with an internal `converter` module. It does not expose a library API, HTTP server, or conversion CLI.
