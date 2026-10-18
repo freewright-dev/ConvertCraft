@@ -33,9 +33,11 @@ The initial target is the first supported target that differs from the input ext
 - **JPEG quality:** 10–100, default 90; affects JPG output only.
 - **Overwrite existing files:** disabled by default. Enable only if replacing existing output files is acceptable.
 
-With overwriting disabled, an existing `photo.png` leads to names such as `photo (1).png`, `photo (2).png`, and so on. Planned outputs are reserved across the batch so two queued jobs cannot select the same path string. Even with overwriting enabled, the planner avoids an output path identical to the source path.
+With overwriting disabled, an existing `photo.png` leads to names such as `photo (1).png`, `photo (2).png`, and so on. The planner reserves names conservatively across the batch and protects every queued input, including case and hard-link aliases. Destination links and special files are skipped even when overwriting is enabled.
 
-These checks use path comparisons, not filesystem identity. Aliases, hard links, case differences, or another process creating a file after planning can bypass these protections. Keep backups of important files; output writes are not atomic.
+Conversions are written to temporary files on the output filesystem and published only after successful encoding and checked writes. A file that appears after planning is not overwritten: that job fails, and retrying chooses a new name. Existing destinations selected for replacement are identity-checked again. If a queued source is missing or inaccessible, remove that row or restore access before starting the batch.
+
+Use an output directory you trust. The application checks for changed directory identities but does not fully isolate pathname operations from hostile processes replacing ancestor directories at the same instant. Atomic publication also does not guarantee durability through every power failure; keep backups of important files.
 
 ## Convert and inspect results
 
@@ -67,7 +69,7 @@ TOML cannot represent null values. CSV output requires an object or an array of 
 
 ### Output cannot be written
 
-Check destination permissions, available space, and whether another application has locked the output. Parent directory creation is attempted, but its error is not reported separately; a subsequent write may fail. Failed image/data writes can leave partial files. Failed FFmpeg conversions attempt to delete their output, including an existing output if overwriting was enabled.
+Check destination permissions, available space, and whether another application has locked the output. Directory creation and write/flush errors are reported. Failed conversions clean up their staging files rather than deleting or truncating an existing destination. If the error says a destination appeared or changed, retry to replan the output name. Forced termination can leave a `.convertcraft-*` staging directory in the destination folder.
 
 ### An animation becomes a still image
 
