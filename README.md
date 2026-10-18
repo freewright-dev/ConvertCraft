@@ -114,7 +114,7 @@ The existing tests exercise image targets, structured data round trips, output-p
 | --- | --- |
 | [`src/main.rs`](src/main.rs) | Native UI, queue, worker scheduling, progress, and file-manager integration |
 | [`src/converter.rs`](src/converter.rs) | Format detection, output planning, conversion backends, and tests |
-| [`assets/logos/`](assets/logos/) | Current transparent logo (`logo.png`), light/dark previews, and previous logo (`logo-original.png`) |
+| [`assets/logos/`](assets/logos/) | Transparent logo (`logo.png`) and light/dark previews (`logo-light.png`, `logo-dark.png`) |
 | [`docs/`](docs/README.md) | User guide, format details, and architecture |
 
 The window title and in-app name use `APP_NAME` in `src/main.rs`. The embedded logo is decoded once at startup and reused for the native icon and UI texture; no external asset folder is needed beside the compiled executable.
