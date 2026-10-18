@@ -3,7 +3,7 @@ name = "convertcraft"
 version = "0.1.0"
 edition = "2024"
 description = "Local desktop batch converter for images, structured data, audio, and video"
-repository = "https://github.com/openfield-labs/convertcraft"
+repository = "https://github.com/freewright-dev/ConvertCraft"
 license = "GPL-3.0-only"
 
 [dependencies]
