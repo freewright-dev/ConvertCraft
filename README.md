@@ -13,6 +13,8 @@
   <a href="docs/development.md">Development</a>
 </p>
 
+<p align="center"><a href="https://discord.gg/SAy3t4BvJj"><img src="https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white" alt="Join the Freewright Discord"></a></p>
+
 ConvertCraft is a native desktop batch converter for **images, structured data, audio, and video**, built with Rust and egui/eframe. Files are processed locally without uploading them to a conversion service. Image and data conversion run in Rust; audio and video use your local FFmpeg installation.
 
 ## What you can do
@@ -128,6 +130,7 @@ For implementation details and extension guidance, read [Development and archite
 - [Development and architecture](docs/development.md)
 - [Changelog](CHANGELOG.md)
 - [Report an issue](https://github.com/freewright-dev/ConvertCraft/issues) — include your OS, source/target formats, and the error text; use non-sensitive sample files when possible.
+- [Freewright Discord](https://discord.gg/SAy3t4BvJj) — questions, ideas, and chat with the community
 
 ## License
 
