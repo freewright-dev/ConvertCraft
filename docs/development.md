@@ -40,9 +40,9 @@ The project is a single binary crate with internal `converter` and `output` modu
 
 ### Import and state
 
-`App` holds queued `FileItem`s, output directory, conversion `Options`, startup FFmpeg availability, worker message receiver, counters, and skipped-file count. A `FileItem` contains its path, detected `Category`, target, and `Status`.
+`App` holds queued `FileItem`s, output directory, conversion `Options`, startup FFmpeg availability, worker message receiver, counters, the running import (if any), and the import summary. A `FileItem` contains its path, detected `Category`, target, and `Status`.
 
-`add_path` recursively imports directories, sorts child paths, skips exact-path duplicates, and categorizes files by extension. It increments the skipped count for unsupported extensions. Paths are not canonicalized, directory read failures are not surfaced, and symlink cycles are not tracked.
+`App::add_paths` starts `import::scan` on a background thread and receives its events over a channel; `poll_import` drains them each frame. The scan (`src/import.rs`) is an iterative depth-first walk in sorted order. Picked roots are followed even when they are links; links found inside folders (`FileType::is_symlink`, which on Windows covers symlinks and junctions but not cloud-file placeholders) are reported and skipped. `import::Limits` bounds depth (64), files (100,000), and folders (20,000). Unsupported extensions, skipped links, too-deep folders, read errors, and special files are reported as events and shown in the top-bar summary. Exact-path duplicates are dropped with a `HashSet`; paths are not canonicalized.
 
 ### Planning
 
@@ -104,4 +104,4 @@ For a new recognized input extension, update `detect` and, if needed, `normalize
 
 Add tests for conversion and expected losses or failure cases, then update [formats.md](formats.md), the [README](../README.md), and [CHANGELOG.md](../CHANGELOG.md). Keep display branding consistent with `main.rs` and package naming consistent with `Cargo.toml`.
 
-Further reliability work includes descriptor-relative operations in hostile directories, bounded/symlink-aware folder traversal, conversion resource limits, and worker panic/shutdown handling.
+Further reliability work includes descriptor-relative operations in hostile directories, conversion resource limits, and worker panic/shutdown handling.

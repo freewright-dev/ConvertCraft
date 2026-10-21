@@ -30,6 +30,8 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Fixed
 
+- Folder import no longer follows links inside folders, runs on a background thread with a Cancel button, and is bounded by depth, file, and folder limits; a folder with links back to itself used to hang the app (#18).
+- Import errors (unreadable folders or entries, special files) are now shown in the top bar instead of being silently dropped (#29).
 - Enforce no-clobber when publishing new outputs, including files created after planning and case-only name collisions.
 - Preserve existing destinations when image/data encoding or FFmpeg fails; publish successful conversions from owned staging files.
 - Protect all queued source paths and file identities from overwrite-enabled batch outputs.

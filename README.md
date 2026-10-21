@@ -115,7 +115,9 @@ The existing tests exercise image targets, structured data round trips, output-p
 | Path | Responsibility |
 | --- | --- |
 | [`src/main.rs`](src/main.rs) | Native UI, queue, worker scheduling, progress, and file-manager integration |
-| [`src/converter.rs`](src/converter.rs) | Format detection, output planning, conversion backends, and tests |
+| [`src/converter.rs`](src/converter.rs) | Format detection, conversion backends, and tests |
+| [`src/output.rs`](src/output.rs) | Output planning, batch input protection, and staged publication |
+| [`src/import.rs`](src/import.rs) | Bounded background folder scan for file and folder import |
 | [`assets/logos/`](assets/logos/) | Transparent logo (`logo.png`) and light/dark previews (`logo-light.png`, `logo-dark.png`) |
 | [`docs/`](docs/README.md) | User guide, format details, and architecture |
 
