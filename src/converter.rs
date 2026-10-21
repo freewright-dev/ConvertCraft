@@ -290,15 +290,18 @@ fn write_csv(value: &Value) -> Result<String> {
 
 // ---------------------------------------------------------------- audio / video
 
+#[cfg(windows)]
 fn ffmpeg_command() -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("ffmpeg");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
+}
+
+#[cfg(not(windows))]
+fn ffmpeg_command() -> Command {
+    Command::new("ffmpeg")
 }
 
 pub fn ffmpeg_available() -> bool {
