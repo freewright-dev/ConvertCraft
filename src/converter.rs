@@ -1,8 +1,11 @@
 //! Conversion backends: images (pure Rust), structured data (pure Rust),
 //! audio/video (delegated to an `ffmpeg` binary on PATH).
 
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -11,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use image::{
     DynamicImage, ImageDecoder, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType,
 };
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::output::OutputPlan;
@@ -105,6 +109,8 @@ fn normalize_ext(ext: &str) -> &str {
 pub struct Options {
     pub jpeg_quality: u8,
     pub overwrite: bool,
+    /// Prefix CSV cells that spreadsheets would evaluate as formulas.
+    pub csv_formula_guard: bool,
 }
 
 impl Default for Options {
@@ -112,6 +118,7 @@ impl Default for Options {
         Self {
             jpeg_quality: 90,
             overwrite: false,
+            csv_formula_guard: true,
         }
     }
 }
@@ -129,7 +136,7 @@ pub fn convert(
     let mut staged = output.begin()?;
     match cat {
         Category::Image => convert_image(input, staged.file_mut(), target, opts)?,
-        Category::Data => convert_data(input, staged.file_mut(), target)?,
+        Category::Data => convert_data(input, staged.file_mut(), target, opts)?,
         Category::Audio | Category::Video => convert_media(input, staged.path(), target)?,
     }
     staged.commit()
@@ -277,46 +284,228 @@ fn encode_jpeg(image: &DynamicImage, writer: &mut impl Write, quality: u8) -> Re
 
 // ---------------------------------------------------------------- data
 
-fn convert_data(input: &Path, output: &mut File, target: &str) -> Result<()> {
-    let text = std::fs::read_to_string(input).context("cannot read file")?;
+/// Largest data file read.
+const MAX_DATA_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Estimated in-memory size of the parsed document. YAML aliases and repeated CSV
+/// headers can expand a small file far beyond its own size.
+const MAX_DATA_VALUE_BYTES: u64 = 768 * 1024 * 1024;
+/// Largest converted data file written.
+const MAX_DATA_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
+/// Excel's column limit; also bounds the rows × headers cell expansion of sparse rows.
+const MAX_CSV_COLUMNS: usize = 16_384;
+/// Rough per-node cost of a `serde_json::Value`, charged on top of string bytes.
+const VALUE_NODE_BYTES: u64 = 64;
+
+fn convert_data(input: &Path, output: &mut File, target: &str, opts: &Options) -> Result<()> {
+    let mut text = String::new();
+    File::open(input)
+        .context("cannot read file")?
+        .take(MAX_DATA_INPUT_BYTES + 1)
+        .read_to_string(&mut text)
+        .context("cannot read file")?;
+    ensure!(
+        text.len() as u64 <= MAX_DATA_INPUT_BYTES,
+        "data file is too large (the limit is {} MiB)",
+        MAX_DATA_INPUT_BYTES >> 20
+    );
+    let budget = ValueBudget::new(MAX_DATA_VALUE_BYTES);
     let value: Value = match normalize_ext(&extension(input)) {
-        "json" => serde_json::from_str(&text).context("invalid JSON")?,
-        "yaml" => serde_yaml::from_str(&text).context("invalid YAML")?,
-        "toml" => toml::from_str(&text).context("invalid TOML")?,
-        "csv" => read_csv(&text)?,
+        "json" => {
+            let mut de = serde_json::Deserializer::from_str(&text);
+            let value = budget.seed().deserialize(&mut de).context("invalid JSON")?;
+            de.end().context("invalid JSON")?;
+            value
+        }
+        "yaml" => budget
+            .seed()
+            .deserialize(serde_yaml::Deserializer::from_str(&text))
+            .context("invalid YAML")?,
+        "toml" => budget
+            .seed()
+            .deserialize(toml::Deserializer::new(&text))
+            .context("invalid TOML")?,
+        "csv" => read_csv(&text, &budget)?,
         other => bail!("unsupported data source: {other}"),
     };
 
-    let out = match target {
-        "json" => serde_json::to_string_pretty(&value)? + "\n",
-        "yaml" => serde_yaml::to_string(&value)?,
+    // Stream into the staged file, refusing to write past the output limit.
+    let mut writer = LimitedWriter {
+        inner: BufWriter::new(output),
+        remaining: MAX_DATA_OUTPUT_BYTES,
+    };
+    match target {
+        "json" => {
+            serde_json::to_writer_pretty(&mut writer, &value)?;
+            writer.write_all(b"\n")?;
+        }
+        "yaml" => serde_yaml::to_writer(&mut writer, &value)?,
         "toml" => {
             // TOML documents must be a table at the top level.
             let value = match value {
                 Value::Object(_) => value,
                 other => Value::Object(Map::from_iter([("items".to_string(), other)])),
             };
-            toml::to_string_pretty(&value)
-                .context("data cannot be represented as TOML (nulls are not allowed)")?
+            let text = toml::to_string_pretty(&value)
+                .context("data cannot be represented as TOML (nulls are not allowed)")?;
+            writer.write_all(text.as_bytes())?;
         }
-        "csv" => write_csv(&value)?,
+        "csv" => write_csv(&value, &mut writer, opts.csv_formula_guard)?,
         other => bail!("unsupported data target: {other}"),
-    };
-    output.write_all(out.as_bytes())?;
+    }
+    writer.flush().context("cannot flush data output")?;
     Ok(())
 }
 
-fn read_csv(text: &str) -> Result<Value> {
+/// Estimated memory charged while a document is built.
+struct ValueBudget {
+    remaining: Cell<u64>,
+}
+
+impl ValueBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            remaining: Cell::new(limit),
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> std::result::Result<(), String> {
+        let cost = VALUE_NODE_BYTES.saturating_add(bytes as u64);
+        match self.remaining.get().checked_sub(cost) {
+            Some(rest) => {
+                self.remaining.set(rest);
+                Ok(())
+            }
+            None => Err(format!(
+                "document expands beyond the {} MiB memory limit",
+                MAX_DATA_VALUE_BYTES >> 20
+            )),
+        }
+    }
+
+    fn seed(&self) -> ValueSeed<'_> {
+        ValueSeed { budget: self }
+    }
+}
+
+/// Builds a `serde_json::Value` like its own `Deserialize` impl, but charges every
+/// node against a budget (so YAML aliases cannot expand without bound) and rejects
+/// duplicate keys instead of keeping the last one.
+#[derive(Clone, Copy)]
+struct ValueSeed<'a> {
+    budget: &'a ValueBudget,
+}
+
+impl ValueSeed<'_> {
+    fn charge<E: de::Error>(self, bytes: usize) -> std::result::Result<(), E> {
+        self.budget.charge(bytes).map_err(E::custom)
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ValueSeed<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any JSON-compatible value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> {
+        self.charge(0)?;
+        Ok(Value::Bool(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
+        self.charge(0)?;
+        Ok(Value::from(v))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+        self.charge(0)?;
+        Ok(Value::from(v))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
+        self.charge(0)?;
+        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
+        self.charge(v.len())?;
+        Ok(Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Value, E> {
+        self.charge(v.len())?;
+        Ok(Value::String(v))
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
+        self.charge(0)?;
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        self.charge(0)?;
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        self.deserialize(deserializer)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        self.charge(0)?;
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(self)? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        self.charge(0)?;
+        let mut object = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            self.charge(key.len())?;
+            if object.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate key {key:?}")));
+            }
+            let value = map.next_value_seed(self)?;
+            object.insert(key, value);
+        }
+        Ok(Value::Object(object))
+    }
+}
+
+fn read_csv(text: &str, budget: &ValueBudget) -> Result<Value> {
     let mut reader = csv::Reader::from_reader(text.as_bytes());
     let headers = reader.headers()?.clone();
+    ensure!(
+        headers.len() <= MAX_CSV_COLUMNS,
+        "CSV has more than {MAX_CSV_COLUMNS} columns"
+    );
+    let mut seen = HashSet::new();
+    for header in &headers {
+        ensure!(seen.insert(header), "duplicate CSV header {header:?}");
+    }
     let mut rows = Vec::new();
     for record in reader.records() {
         let record = record?;
-        let row: Map<String, Value> = headers
-            .iter()
-            .zip(record.iter())
-            .map(|(h, v)| (h.to_string(), infer_scalar(v)))
-            .collect();
+        let mut row = Map::new();
+        for (header, field) in headers.iter().zip(record.iter()) {
+            // Every row stores its own copy of each header name.
+            budget
+                .charge(header.len() + field.len())
+                .map_err(|message| anyhow!(message))?;
+            row.insert(header.to_string(), infer_scalar(field));
+        }
         rows.push(Value::Object(row));
     }
     Ok(Value::Array(rows))
@@ -326,13 +515,25 @@ fn infer_scalar(s: &str) -> Value {
     if s.is_empty() {
         return Value::Null;
     }
-    if let Ok(i) = s.parse::<i64>() {
-        return Value::from(i);
-    }
-    if let Ok(f) = s.parse::<f64>()
-        && f.is_finite()
-    {
-        return Value::from(f);
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let integer_like = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    // Identifiers such as "00042" keep their leading zeros.
+    let leading_zero =
+        digits.len() > 1 && digits.starts_with('0') && digits.as_bytes()[1].is_ascii_digit();
+    if !leading_zero {
+        if let Ok(i) = s.parse::<i64>() {
+            return Value::from(i);
+        }
+        if let Ok(u) = s.parse::<u64>() {
+            return Value::from(u);
+        }
+        // Integers beyond 64 bits stay exact as text rather than rounding through f64.
+        if !integer_like
+            && let Ok(f) = s.parse::<f64>()
+            && f.is_finite()
+        {
+            return Value::from(f);
+        }
     }
     match s {
         "true" => Value::Bool(true),
@@ -341,7 +542,16 @@ fn infer_scalar(s: &str) -> Value {
     }
 }
 
-fn write_csv(value: &Value) -> Result<String> {
+/// Prefix text that a spreadsheet would evaluate as a formula (OWASP CSV injection list).
+fn csv_text(s: &str, formula_guard: bool) -> Cow<'_, str> {
+    if formula_guard && s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        Cow::Owned(format!("'{s}"))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+fn write_csv(value: &Value, output: impl Write, formula_guard: bool) -> Result<()> {
     let rows: Vec<&Map<String, Value>> = match value {
         Value::Array(items) => items
             .iter()
@@ -356,28 +566,59 @@ fn write_csv(value: &Value) -> Result<String> {
 
     // Union of all keys, in first-seen order.
     let mut headers: Vec<&str> = Vec::new();
+    let mut seen = HashSet::new();
     for row in &rows {
         for key in row.keys() {
-            if !headers.contains(&key.as_str()) {
+            if seen.insert(key.as_str()) {
+                ensure!(
+                    headers.len() < MAX_CSV_COLUMNS,
+                    "CSV would have more than {MAX_CSV_COLUMNS} columns"
+                );
                 headers.push(key);
             }
         }
     }
 
-    let mut writer = csv::Writer::from_writer(Vec::new());
-    writer.write_record(&headers)?;
-    for row in rows {
-        let record: Vec<String> = headers
+    let mut writer = csv::Writer::from_writer(output);
+    writer.write_record(
+        headers
             .iter()
-            .map(|h| match row.get(*h) {
-                None | Some(Value::Null) => String::new(),
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => other.to_string(),
-            })
-            .collect();
-        writer.write_record(&record)?;
+            .map(|h| csv_text(h, formula_guard).into_owned()),
+    )?;
+    for row in rows {
+        let record = headers.iter().map(|h| match row.get(*h) {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(s)) => csv_text(s, formula_guard).into_owned(),
+            Some(other) => other.to_string(),
+        });
+        writer.write_record(record)?;
     }
-    Ok(String::from_utf8(writer.into_inner()?)?)
+    writer.flush()?;
+    Ok(())
+}
+
+/// Fails once more than `remaining` bytes would be written.
+struct LimitedWriter<W> {
+    inner: W,
+    remaining: u64,
+}
+
+impl<W: Write> Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() as u64 > self.remaining {
+            return Err(std::io::Error::other(format!(
+                "converted output would exceed the {} MiB limit",
+                MAX_DATA_OUTPUT_BYTES >> 20
+            )));
+        }
+        let written = self.inner.write(buf)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 // ---------------------------------------------------------------- audio / video
@@ -612,6 +853,127 @@ mod tests {
         waiter.join().unwrap();
         // Oversized requests are clamped and run alone instead of deadlocking.
         drop(BUDGET.reserve(1_000));
+    }
+
+    fn convert_text(name: &str, contents: &str, target: &str, opts: &Options) -> Result<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join(name);
+        std::fs::write(&src, contents).unwrap();
+        let out = convert_to(&src, dir.path(), Category::Data, target, opts)?;
+        Ok(std::fs::read_to_string(out).unwrap())
+    }
+
+    #[test]
+    fn yaml_alias_expansion_is_budgeted() {
+        let mut yaml = format!("anchor: &s {}\nrefs: [", "x".repeat(4096));
+        yaml.push_str(&vec!["*s"; 1000].join(","));
+        yaml.push_str("]\n");
+        let budget = ValueBudget::new(1024 * 1024);
+        let error = budget
+            .seed()
+            .deserialize(serde_yaml::Deserializer::from_str(&yaml))
+            .unwrap_err();
+        assert!(error.to_string().contains("memory limit"), "{error}");
+        // The same document fits a budget large enough for its ~4 MB expansion.
+        let budget = ValueBudget::new(8 * 1024 * 1024);
+        let value = budget
+            .seed()
+            .deserialize(serde_yaml::Deserializer::from_str(&yaml))
+            .unwrap();
+        assert_eq!(value["refs"].as_array().unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn duplicate_keys_and_headers_are_rejected() {
+        let opts = Options::default();
+        for (name, contents) in [
+            ("dup.json", r#"{"a": 1, "a": 2}"#),
+            ("dup.yaml", "a: 1\na: 2\n"),
+            ("dup.csv", "x,x\nfirst,second\n"),
+        ] {
+            let error = convert_text(name, contents, "json", &opts).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("duplicate"),
+                "{name}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_scalars_keep_exact_integers_and_identifiers() {
+        let csv = "v\n00042\n-007\n0\n-7\n+5\n18446744073709551615\n18446744073709551616\n0.5\n1e3\n1e400\ntrue\n";
+        let json = convert_text("in.csv", csv, "json", &Options::default()).unwrap();
+        let rows: Value = serde_json::from_str(&json).unwrap();
+        let values: Vec<&Value> = rows.as_array().unwrap().iter().map(|r| &r["v"]).collect();
+        assert_eq!(
+            values,
+            [
+                &Value::from("00042"),
+                &Value::from("-007"),
+                &Value::from(0),
+                &Value::from(-7),
+                &Value::from(5),
+                &Value::from(u64::MAX),
+                &Value::from("18446744073709551616"),
+                &Value::from(0.5),
+                &Value::from(1000.0),
+                &Value::from("1e400"),
+                &Value::from(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn csv_formulas_are_neutralized_unless_disabled() {
+        let json = r#"[{"=1+1": "=HYPERLINK(\"http://example.invalid\")", "n": "@SUM(1,2)", "ok": "plain", "num": -5}]"#;
+        let safe = convert_text("in.json", json, "csv", &Options::default()).unwrap();
+        assert_eq!(
+            safe,
+            "'=1+1,n,num,ok\n\"'=HYPERLINK(\"\"http://example.invalid\"\")\",\"'@SUM(1,2)\",-5,plain\n"
+        );
+        let raw_opts = Options {
+            csv_formula_guard: false,
+            ..Options::default()
+        };
+        let raw = convert_text("in.json", json, "csv", &raw_opts).unwrap();
+        assert!(raw.starts_with("=1+1,"), "{raw}");
+    }
+
+    #[test]
+    fn sparse_csv_columns_are_capped() {
+        let rows: Vec<String> = (0..=MAX_CSV_COLUMNS)
+            .map(|i| format!(r#"{{"k{i}":0}}"#))
+            .collect();
+        let json = format!("[{}]", rows.join(","));
+        let error = convert_text("sparse.json", &json, "csv", &Options::default()).unwrap_err();
+        assert!(format!("{error:#}").contains("columns"), "{error:#}");
+    }
+
+    #[test]
+    fn data_input_and_output_sizes_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.json");
+        let file = File::create(&src).unwrap();
+        file.set_len(MAX_DATA_INPUT_BYTES + 1).unwrap();
+        drop(file);
+        let error = convert_to(
+            &src,
+            dir.path(),
+            Category::Data,
+            "yaml",
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("too large"), "{error:#}");
+
+        let mut writer = LimitedWriter {
+            inner: Vec::new(),
+            remaining: 4,
+        };
+        writer.write_all(b"1234").unwrap();
+        let error = writer.write_all(b"5").unwrap_err();
+        assert!(error.to_string().contains("limit"), "{error}");
+        assert_eq!(writer.inner, b"1234");
     }
 
     #[test]
