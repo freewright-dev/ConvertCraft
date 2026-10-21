@@ -811,13 +811,14 @@ dependencies = [
  "csv",
  "eframe",
  "image",
+ "libc",
  "rfd",
- "same-file",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "toml",
+ "winapi-util",
 ]
 
 [[package]]

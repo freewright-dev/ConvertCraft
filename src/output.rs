@@ -3,33 +3,103 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail, ensure};
-use same_file::Handle;
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use tempfile::{NamedTempFile, TempDir};
 
 const MAX_NAME_ATTEMPTS: usize = 10_000;
 
+/// File identity (volume + file ID) read once, without keeping the file open, so a
+/// batch holds no descriptors per queued job.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FileKey {
+    volume: u64,
+    index: u64,
+}
+
+impl FileKey {
+    /// `None` when the file system reports no usable file ID (some network and FAT
+    /// redirectors report 0); identity checks then fail safe.
+    fn new(volume: u64, index: u64) -> Option<Self> {
+        (index != 0).then_some(Self { volume, index })
+    }
+
+    fn of_path(path: &Path) -> io::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(path)?;
+            Ok(Self::new(metadata.dev(), metadata.ino()))
+        }
+        #[cfg(windows)]
+        {
+            let handle = winapi_util::Handle::from_path_any(path)?;
+            let info = winapi_util::file::information(&handle)?;
+            Ok(Self::new(info.volume_serial_number(), info.file_index()))
+        }
+    }
+
+    fn of_file(file: &File) -> io::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            Ok(Self::new(metadata.dev(), metadata.ino()))
+        }
+        #[cfg(windows)]
+        {
+            let info = winapi_util::file::information(winapi_util::HandleRef::from_file(file))?;
+            Ok(Self::new(info.volume_serial_number(), info.file_index()))
+        }
+    }
+}
+
+/// True only when both identities are known and equal.
+fn same_file(a: Option<FileKey>, b: Option<FileKey>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a == b)
+}
+
 #[derive(Default)]
 struct ProtectedInputs {
     paths: HashSet<OsString>,
-    // Keep handles alive so file IDs cannot be recycled during the batch.
-    files: HashSet<Handle>,
+    files: HashSet<FileKey>,
     // Encoders run concurrently; serialize publication so filesystem aliases
     // missed by name folding are rechecked after the preceding commit.
     publication: Mutex<()>,
 }
 
 impl ProtectedInputs {
+    fn protect(&mut self, input: &Path) -> Result<()> {
+        // Reserve the names first, so even a source that cannot be inspected is
+        // never chosen as an output.
+        self.paths.insert(path_key(input));
+        let parent = parent_directory(input)
+            .canonicalize()
+            .context("cannot resolve source directory")?;
+        let name = input.file_name().context("source has no filename")?;
+        self.paths.insert(path_key(&parent.join(name)));
+        // Protect both a symlink's own name and its resolved target.
+        self.paths.insert(path_key(
+            &input.canonicalize().context("cannot resolve source")?,
+        ));
+        ensure!(input.metadata()?.is_file(), "source is not a regular file");
+        if let Some(key) = FileKey::of_path(input).context("cannot check source identity")? {
+            self.files.insert(key);
+        }
+        Ok(())
+    }
+
     fn contains(&self, path: &Path) -> Result<bool> {
         if self.paths.contains(&path_key(path)) {
             return Ok(true);
         }
-        match Handle::from_path(path) {
-            Ok(file) => Ok(self.files.contains(&file)),
+        match FileKey::of_path(path) {
+            Ok(Some(key)) => Ok(self.files.contains(&key)),
+            // Existing file whose identity cannot be checked: assume it may be a source.
+            Ok(None) => Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error).context("cannot check destination file identity"),
         }
@@ -43,34 +113,23 @@ pub struct OutputPlanner {
 }
 
 impl OutputPlanner {
-    pub fn new<'a>(inputs: impl IntoIterator<Item = &'a Path>) -> Result<Self> {
+    /// Protects every input and returns the ones that could not be inspected, by
+    /// position. Those rows should not be converted; the others are unaffected.
+    pub fn new<'a>(
+        inputs: impl IntoIterator<Item = &'a Path>,
+    ) -> (Self, Vec<(usize, anyhow::Error)>) {
         let mut protected = ProtectedInputs::default();
-        for input in inputs {
-            let parent = parent_directory(input)
-                .canonicalize()
-                .with_context(|| format!("cannot resolve source directory: {}", input.display()))?;
-            let name = input.file_name().context("source has no filename")?;
-            protected.paths.insert(path_key(&parent.join(name)));
-            // Protect both a symlink's own name and its resolved target.
-            protected.paths.insert(path_key(
-                &input
-                    .canonicalize()
-                    .with_context(|| format!("cannot resolve source: {}", input.display()))?,
-            ));
-            ensure!(
-                input.metadata()?.is_file(),
-                "source is not a regular file: {}",
-                input.display()
-            );
-            protected.files.insert(
-                Handle::from_path(input)
-                    .with_context(|| format!("cannot protect source: {}", input.display()))?,
-            );
+        let mut errors = Vec::new();
+        for (index, input) in inputs.into_iter().enumerate() {
+            if let Err(error) = protected.protect(input) {
+                errors.push((index, error.context(format!("{}", input.display()))));
+            }
         }
-        Ok(Self {
+        let planner = Self {
             inputs: Arc::new(protected),
             reserved_paths: HashSet::new(),
-        })
+        };
+        (planner, errors)
     }
 
     pub fn plan(
@@ -84,13 +143,14 @@ impl OutputPlanner {
             !target.is_empty() && target.bytes().all(|byte| byte.is_ascii_alphanumeric()),
             "invalid output extension"
         );
+        let source = FileKey::of_path(input).context("cannot check source identity")?;
         let directory = out_dir.unwrap_or_else(|| parent_directory(input));
         fs::create_dir_all(directory).context("cannot create output directory")?;
         let directory = directory
             .canonicalize()
             .context("cannot resolve output directory")?;
-        let directory_handle =
-            Handle::from_path(&directory).context("cannot check output directory identity")?;
+        let directory_key =
+            FileKey::of_path(&directory).context("cannot check output directory identity")?;
         let stem = input.file_stem().context("source has no file stem")?;
 
         for suffix in 0..MAX_NAME_ATTEMPTS {
@@ -110,12 +170,14 @@ impl OutputPlanner {
                     if !overwrite || !metadata.is_file() || is_link(&metadata) {
                         continue;
                     }
-                    let handle = Handle::from_path(&path)
-                        .context("cannot check existing output identity")?;
-                    if self.inputs.files.contains(&handle) {
-                        continue;
+                    let existing =
+                        FileKey::of_path(&path).context("cannot check existing output identity")?;
+                    // Replace only files whose identity can be rechecked at commit
+                    // and that are not a batch source.
+                    match existing {
+                        Some(key) if !self.inputs.files.contains(&key) => Some(key),
+                        _ => continue,
                     }
-                    Some(handle)
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => None,
                 Err(error) => return Err(error).context("cannot inspect output path"),
@@ -123,9 +185,10 @@ impl OutputPlanner {
             self.reserved_paths.insert(key);
             return Ok(OutputPlan {
                 path,
-                directory_handle,
+                directory_key,
                 inputs: Arc::clone(&self.inputs),
                 existing,
+                source,
             });
         }
         bail!("no available output name after {MAX_NAME_ATTEMPTS} attempts")
@@ -135,20 +198,49 @@ impl OutputPlanner {
 /// Only the planner can construct a destination, including its overwrite policy.
 pub struct OutputPlan {
     path: PathBuf,
-    directory_handle: Handle,
+    directory_key: Option<FileKey>,
     inputs: Arc<ProtectedInputs>,
-    existing: Option<Handle>,
+    existing: Option<FileKey>,
+    source: Option<FileKey>,
 }
 
 impl OutputPlan {
     fn check_directory(&self) -> Result<()> {
-        let current = Handle::from_path(parent_directory(&self.path))
+        let current = FileKey::of_path(parent_directory(&self.path))
             .context("output directory is no longer accessible")?;
-        ensure!(
-            current == self.directory_handle,
-            "output directory changed during conversion"
-        );
+        // A directory without a usable file ID cannot be rechecked.
+        if self.directory_key.is_some() {
+            ensure!(
+                same_file(current, self.directory_key),
+                "output directory changed during conversion"
+            );
+        }
         Ok(())
+    }
+
+    /// Open the source for reading and check that it is still the regular file that
+    /// was planned, so a file swapped in after planning is not converted.
+    pub fn open_source(&self, input: &Path) -> Result<File> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            // A FIFO swapped in for the source must not block the worker in open().
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(input).context("cannot open source")?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "source is no longer a regular file"
+        );
+        if self.source.is_some() {
+            ensure!(
+                same_file(FileKey::of_file(&file)?, self.source),
+                "source changed since the batch started; retry conversion"
+            );
+        }
+        Ok(file)
     }
 
     pub fn begin(self) -> Result<StagedOutput> {
@@ -205,18 +297,20 @@ impl StagedOutput {
             .inputs
             .publication
             .lock()
-            .map_err(|_| anyhow::anyhow!("output publication lock was poisoned"))?;
+            .map_err(|_| anyhow!("output publication lock was poisoned"))?;
         self.plan.check_directory()?;
         ensure!(
             !self.plan.inputs.contains(&self.plan.path)?,
             "output aliases a protected source"
         );
         // Detect a replaced staged pathname, including replacement by an external encoder.
-        ensure!(
-            Handle::from_file(self.file.as_file().try_clone()?)?
-                == Handle::from_path(self.file.path())?,
-            "staged output changed during conversion"
-        );
+        let staged = FileKey::of_file(self.file.as_file())?;
+        if staged.is_some() {
+            ensure!(
+                same_file(staged, FileKey::of_path(self.file.path())?),
+                "staged output changed during conversion"
+            );
+        }
         if let Some(expected) = self.plan.existing {
             let metadata = fs::symlink_metadata(&self.plan.path)
                 .context("existing destination disappeared; retry conversion")?;
@@ -224,12 +318,10 @@ impl StagedOutput {
                 metadata.is_file() && !is_link(&metadata),
                 "destination is no longer a regular file"
             );
-            let current = Handle::from_path(&self.plan.path)?;
-            ensure!(current == expected, "destination changed; retry conversion");
-            // Windows replacement can reject an open destination handle. Finish
-            // identity checks and close our destination handles before renaming.
-            drop(current);
-            drop(expected);
+            ensure!(
+                FileKey::of_path(&self.plan.path)? == Some(expected),
+                "destination changed; retry conversion"
+            );
             self.file
                 .persist(&self.plan.path)
                 .map_err(|error| error.error)
@@ -278,10 +370,101 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn protect_all<'a>(inputs: impl IntoIterator<Item = &'a Path>) -> OutputPlanner {
+        let (planner, errors) = OutputPlanner::new(inputs);
+        assert!(errors.is_empty(), "{errors:?}");
+        planner
+    }
+
     fn publish(plan: OutputPlan, bytes: &[u8]) -> Result<PathBuf> {
         let mut staged = plan.begin()?;
         staged.file_mut().write_all(bytes)?;
         staged.commit()
+    }
+
+    #[test]
+    fn unresolvable_inputs_are_reported_per_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.json");
+        let missing = dir.path().join("missing.json");
+        let folder = dir.path().join("folder.json");
+        fs::write(&good, b"{}").unwrap();
+        fs::create_dir(&folder).unwrap();
+        let (mut planner, errors) =
+            OutputPlanner::new([missing.as_path(), good.as_path(), folder.as_path()]);
+        let failed: Vec<usize> = errors.iter().map(|(index, _)| *index).collect();
+        assert_eq!(failed, [0, 2]);
+        assert!(format!("{:#}", errors[1].1).contains("not a regular file"));
+        // The remaining row still plans and publishes.
+        publish(planner.plan(&good, None, "yaml", false).unwrap(), b"ok").unwrap();
+        // A failed row's own name is still reserved.
+        let plan = planner.plan(&good, None, "json", false).unwrap();
+        assert_ne!(plan.path.file_name().unwrap(), "missing.json");
+    }
+
+    #[test]
+    fn unknown_file_ids_never_compare_equal() {
+        assert_eq!(FileKey::new(7, 0), None);
+        let key = FileKey::new(7, 42);
+        assert!(same_file(key, key));
+        assert!(!same_file(None, None));
+        assert!(!same_file(key, None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn planning_holds_no_file_descriptors() {
+        let open_fds = || fs::read_dir("/proc/self/fd").unwrap().count();
+        let dir = tempfile::tempdir().unwrap();
+        let inputs: Vec<PathBuf> = (0..300)
+            .map(|i| {
+                let path = dir.path().join(format!("{i}.json"));
+                fs::write(&path, b"{}").unwrap();
+                path
+            })
+            .collect();
+        let before = open_fds();
+        let mut planner = protect_all(inputs.iter().map(PathBuf::as_path));
+        let plans: Vec<_> = inputs
+            .iter()
+            .map(|input| planner.plan(input, None, "yaml", false).unwrap())
+            .collect();
+        // Other test threads may hold a few descriptors; 300 jobs used to hold 600.
+        assert!(open_fds() < before + 20, "{} -> {}", before, open_fds());
+        drop(plans);
+    }
+
+    #[test]
+    fn source_replaced_after_planning_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.json");
+        fs::write(&input, b"original").unwrap();
+        let mut planner = protect_all([input.as_path()]);
+        let plan = planner.plan(&input, None, "yaml", false).unwrap();
+        assert!(plan.open_source(&input).is_ok());
+        let moved = dir.path().join("moved.json");
+        fs::rename(&input, &moved).unwrap();
+        fs::write(&input, b"swapped").unwrap();
+        let error = plan.open_source(&input).unwrap_err();
+        assert!(format!("{error:#}").contains("source changed"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_swapped_in_for_source_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.json");
+        fs::write(&input, b"{}").unwrap();
+        let mut planner = protect_all([input.as_path()]);
+        let plan = planner.plan(&input, None, "yaml", false).unwrap();
+        fs::remove_file(&input).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let error = plan.open_source(&input).unwrap_err();
+        assert!(format!("{error:#}").contains("regular file"), "{error:#}");
     }
 
     #[test]
@@ -291,7 +474,7 @@ mod tests {
             let input = dir.path().join("input.json");
             let output = dir.path().join("input.yaml");
             fs::write(&input, b"{}").unwrap();
-            let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+            let mut planner = protect_all([input.as_path()]);
             let plan = planner.plan(&input, None, "yaml", overwrite).unwrap();
             fs::write(&output, b"created after planning").unwrap();
             assert!(publish(plan, b"replacement").is_err());
@@ -307,8 +490,7 @@ mod tests {
         fs::write(&input, b"{}").unwrap();
         let plans: Vec<_> = (0..2)
             .map(|_| {
-                OutputPlanner::new([input.as_path()])
-                    .unwrap()
+                protect_all([input.as_path()])
                     .plan(&input, None, "yaml", false)
                     .unwrap()
             })
@@ -346,7 +528,7 @@ mod tests {
         let yaml = dir.path().join("batch.yaml");
         fs::write(&json, b"json source").unwrap();
         fs::write(&yaml, b"yaml source").unwrap();
-        let mut planner = OutputPlanner::new([json.as_path(), yaml.as_path()]).unwrap();
+        let mut planner = protect_all([json.as_path(), yaml.as_path()]);
         let first = planner.plan(&json, None, "yaml", true).unwrap();
         let second = planner.plan(&yaml, None, "json", true).unwrap();
         assert_eq!(first.path.file_name().unwrap(), "batch (1).yaml");
@@ -360,7 +542,7 @@ mod tests {
         let lower = dir.path().join("a.yaml");
         fs::write(&upper, b"upper source").unwrap();
         fs::write(&lower, b"lower source").unwrap();
-        let mut planner = OutputPlanner::new([upper.as_path(), lower.as_path()]).unwrap();
+        let mut planner = protect_all([upper.as_path(), lower.as_path()]);
         let first = planner.plan(&upper, None, "csv", false).unwrap();
         let second = planner.plan(&lower, None, "csv", false).unwrap();
         let a = publish(first, b"first").unwrap();
@@ -376,7 +558,7 @@ mod tests {
         let alias = dir.path().join("input.yaml");
         fs::write(&input, b"source").unwrap();
         fs::hard_link(&input, &alias).unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let plan = planner.plan(&input, None, "yaml", true).unwrap();
         assert_eq!(plan.path.file_name().unwrap(), "input (1).yaml");
         publish(plan, b"converted").unwrap();
@@ -390,7 +572,7 @@ mod tests {
         let input = dir.path().join("input.json");
         let output = dir.path().join("input.yaml");
         fs::write(&input, b"source").unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let plan = planner.plan(&input, None, "yaml", true).unwrap();
         fs::hard_link(&input, &output).unwrap();
         assert!(publish(plan, b"replacement").is_err());
@@ -405,7 +587,7 @@ mod tests {
         let output = dir.path().join("input.yaml");
         fs::write(&input, b"source").unwrap();
         fs::write(&output, b"old output").unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let plan = planner.plan(&input, None, "yaml", true).unwrap();
         fs::remove_file(&output).unwrap();
         fs::write(&output, b"different file").unwrap();
@@ -418,7 +600,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.json");
         fs::write(&input, b"source").unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let plan = planner.plan(&input, None, "yaml", false).unwrap();
         let mut staged = plan.begin().unwrap();
         staged.file_mut().write_all(b"partial").unwrap();
@@ -435,7 +617,7 @@ mod tests {
         let input = dir.path().join("input.json");
         let output_dir = dir.path().join("output");
         fs::write(&input, b"source").unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let plan = planner
             .plan(&input, Some(&output_dir), "yaml", true)
             .unwrap();
@@ -451,7 +633,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("source.JSON");
         fs::write(&input, b"original").unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let plan = planner.plan(&input, None, "json", true).unwrap();
         assert_eq!(plan.path.file_name().unwrap(), "source (1).json");
         publish(plan, b"converted").unwrap();
@@ -494,7 +676,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(dir.path(), &alias).unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let first = planner.plan(&input, Some(&alias), "yaml", true).unwrap();
         let second = planner
             .plan(&input, Some(dir.path()), "yaml", true)
@@ -514,7 +696,7 @@ mod tests {
         let victim = dir.path().join("victim");
         fs::write(&input, b"source").unwrap();
         fs::write(&victim, b"must survive").unwrap();
-        let mut planner = OutputPlanner::new([input.as_path()]).unwrap();
+        let mut planner = protect_all([input.as_path()]);
         let plan = planner.plan(&input, None, "yaml", false).unwrap();
         if !file_symlink(&victim, &dir.path().join("input.yaml")) {
             return;

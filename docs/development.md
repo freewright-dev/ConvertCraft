@@ -33,7 +33,7 @@ The project is a single binary crate with internal `converter` and `output` modu
 - `image`: image decoding, normalization, resizing, and encoding.
 - `serde_json`, `serde_yaml`, `toml`, `csv`: structured data parsing and serialization.
 - `anyhow`: backend errors with context.
-- `tempfile`, `same-file`: owned staging files/directories and filesystem identity checks.
+- `tempfile`: owned staging files/directories. `winapi-util` (Windows) and `libc` (Unix): file identity keys and non-blocking source opens.
 - Standard-library threads, channels, locks, and subprocesses: job execution and FFmpeg integration.
 
 ## Conversion lifecycle
@@ -48,7 +48,13 @@ The project is a single binary crate with internal `converter` and `output` modu
 
 `App::start` first constructs an `OutputPlanner` protecting all queued inputs, including completed rows. It ignores completed rows for conversion and marks media rows failed when FFmpeg was unavailable at startup. For each remaining row, the planner chooses a source-adjacent or custom-directory path, adding numbered suffixes when needed, up to 10,000 attempts per job.
 
-The planner resolves parent directories, conservatively case-folds reserved names, and keeps source file-identity handles alive across the batch. It protects input paths and hard-link identities, skips destination links/reparse points and special files, and records the identity of any existing file selected for replacement. Failure to inspect/protect batch inputs stops scheduling and reports an error. Remove stale or inaccessible rows before retrying. Directory creation failures are also reported.
+The planner resolves parent directories, conservatively case-folds reserved names, and records each source's `FileKey` (device and inode on Unix; volume serial and file index on Windows). Keys are read and the file closed immediately, so a batch holds no open file per queued job. It protects input paths and hard-link identities, skips destination links/reparse points and special files, and records the key of any existing file selected for replacement.
+
+`OutputPlanner::new` returns per-input errors instead of failing the batch: a source that cannot be inspected fails only its own row, and is ignored if that row is already done. Its names are still reserved so no output can take them.
+
+A file system that reports file index 0 (some network and FAT redirectors) gives an unknown identity. Checks then fail safe: an existing destination with unknown identity is never replaced (a numbered name is used instead), and an existing file of unknown identity is treated as a possible source. File indexes on ReFS are 128-bit; the 64-bit index used here is not guaranteed unique there.
+
+Before converting, `OutputPlan::open_source` opens the source once (non-blocking on Unix, so a FIFO cannot hang the worker), checks it is still a regular file with the planned identity, and the image/data backends read from that handle. FFmpeg reopens the path itself immediately after the same check. Directory creation failures are also reported.
 
 ### Workers and UI updates
 
