@@ -237,10 +237,10 @@ fn infer_scalar(s: &str) -> Value {
     if let Ok(i) = s.parse::<i64>() {
         return Value::from(i);
     }
-    if let Ok(f) = s.parse::<f64>() {
-        if f.is_finite() {
-            return Value::from(f);
-        }
+    if let Ok(f) = s.parse::<f64>()
+        && f.is_finite()
+    {
+        return Value::from(f);
     }
     match s {
         "true" => Value::Bool(true),
@@ -290,15 +290,18 @@ fn write_csv(value: &Value) -> Result<String> {
 
 // ---------------------------------------------------------------- audio / video
 
+#[cfg(windows)]
 fn ffmpeg_command() -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("ffmpeg");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
+}
+
+#[cfg(not(windows))]
+fn ffmpeg_command() -> Command {
+    Command::new("ffmpeg")
 }
 
 pub fn ffmpeg_available() -> bool {
@@ -398,6 +401,11 @@ fn convert_media(input: &Path, output: &Path, target: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::output::OutputPlanner;
+
+    /// Skipping is fine locally; CI sets `var` so a missing dependency fails the test.
+    fn require_unset(var: &str, reason: &str) {
+        assert!(std::env::var_os(var).is_none(), "{var} is set but {reason}");
+    }
 
     fn convert_to(
         input: &Path,
@@ -548,6 +556,7 @@ mod tests {
     #[test]
     fn failed_ffmpeg_conversion_preserves_existing_output() {
         if !ffmpeg_available() {
+            require_unset("CONVERTCRAFT_REQUIRE_FFMPEG", "ffmpeg is unavailable");
             eprintln!("skipping FFmpeg failure test: ffmpeg is unavailable");
             return;
         }
@@ -568,6 +577,7 @@ mod tests {
     #[test]
     fn media_via_ffmpeg() {
         if !ffmpeg_available() {
+            require_unset("CONVERTCRAFT_REQUIRE_FFMPEG", "ffmpeg is unavailable");
             return;
         }
         let dir = tempfile::tempdir().unwrap();

@@ -84,9 +84,19 @@ Tests live in `src/converter.rs` and `src/output.rs`:
 - `media_via_ffmpeg`: generates a one-second video/audio fixture, converts every video target, then converts extracted WAV audio to every audio target.
 - Backend regressions verify sentinel preservation on malformed data/media and unsupported JPEG dimensions, successful replacement, cross-format batches, and propagation of buffered JPEG write errors.
 
-The media test returns early if FFmpeg is unavailable, so a passing `cargo test` alone does not prove media conversions ran. When FFmpeg is available, its build must include the required encoders and `lavfi` test sources.
+The media tests return early if FFmpeg is unavailable, so a passing `cargo test` alone does not prove media conversions ran. Set `CONVERTCRAFT_REQUIRE_FFMPEG=1` to make them fail instead of skipping. When FFmpeg is available, its build must include the required encoders and `lavfi` test sources.
 
-Each test owns a unique temporary directory that is cleaned up on completion. There are no automated UI tests, exhaustive malformed-input tests, or exhaustive data-fidelity checks. Platform behavior must be tested on the respective operating systems. On Windows, symlink tests print a skip diagnostic if Developer Mode/symlink privilege is unavailable; ensure a CI lane has this capability.
+Each test owns a unique temporary directory that is cleaned up on completion. There are no automated UI tests, exhaustive malformed-input tests, or exhaustive data-fidelity checks. Platform behavior must be tested on the respective operating systems. On Windows, symlink tests print a skip diagnostic if Developer Mode/symlink privilege is unavailable; set `CONVERTCRAFT_REQUIRE_SYMLINKS=1` to make that a failure.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes to `master` and on pull requests:
+
+- `cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings` on Linux.
+- `cargo test --locked` on Linux, Windows, and macOS with FFmpeg installed and both `CONVERTCRAFT_REQUIRE_*` variables set, so media and symlink tests cannot skip silently.
+- `cargo deny check` using [`deny.toml`](../deny.toml): RustSec advisories, license allowlist, crates.io-only sources. Each ignored advisory names its reason and tracking issue.
+
+The crate root declares `#![forbid(unsafe_code)]`.
 
 ## Extending the converter
 

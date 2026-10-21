@@ -12,6 +12,9 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Added
 
+- CI workflow: rustfmt, Clippy with `-D warnings`, tests on Linux/Windows/macOS with FFmpeg, and `cargo deny check` with a committed `deny.toml` policy (#20).
+- `#![forbid(unsafe_code)]` at the crate root.
+- `CONVERTCRAFT_REQUIRE_FFMPEG` / `CONVERTCRAFT_REQUIRE_SYMLINKS` test switches that turn skipped media/symlink tests into failures.
 - ConvertCraft desktop interface built with egui/eframe.
 - Supplied logo embedded as the window icon and displayed in the README.
 - File selection, recursive folder import, drag-and-drop, and duplicate-path filtering.
