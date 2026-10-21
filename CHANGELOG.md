@@ -35,6 +35,8 @@ This changelog records the current implementation. `Cargo.toml` declares version
 - Data conversion is bounded: 64 MiB input limit, a 768 MiB estimated memory budget enforced while parsing (stops YAML alias and wide-CSV-header expansion), output streamed to disk with a 1 GiB limit, and at most 16,384 CSV columns. The CSV header union is no longer quadratic (#13).
 - CSV output neutralizes spreadsheet formulas by default (**Safe CSV for spreadsheets** option) (#15).
 - Duplicate JSON/YAML keys and CSV headers are rejected instead of silently keeping the last value; CSV integers with leading zeros or beyond 64 bits stay exact text instead of becoming rounded numbers (#28).
+- Folder import no longer follows links inside folders, runs on a background thread with a Cancel button, and is bounded by depth, file, and folder limits; a folder with links back to itself used to hang the app (#18).
+- Import errors (unreadable folders or entries, special files) are now shown in the top bar instead of being silently dropped (#29).
 - Enforce no-clobber when publishing new outputs, including files created after planning and case-only name collisions.
 - Preserve existing destinations when image/data encoding or FFmpeg fails; publish successful conversions from owned staging files.
 - Protect all queued source paths and file identities from overwrite-enabled batch outputs.
