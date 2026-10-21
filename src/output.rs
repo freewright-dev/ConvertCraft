@@ -35,6 +35,11 @@ impl FileKey {
         })
     }
 
+    /// Same volume and file ID, ignoring the change time.
+    fn same_object(self, other: Self) -> bool {
+        self.volume == other.volume && self.index == other.index
+    }
+
     #[cfg(unix)]
     fn from_metadata(metadata: &Metadata) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
@@ -222,10 +227,12 @@ impl OutputPlan {
     fn check_directory(&self) -> Result<()> {
         let current = FileKey::of_path(parent_directory(&self.path))
             .context("output directory is no longer accessible")?;
-        // A directory without a usable file ID cannot be rechecked.
-        if self.directory_key.is_some() {
+        // A directory without a usable file ID cannot be rechecked. Its change time
+        // moves whenever an entry (such as our staging folder) is created, so compare
+        // the object only; a reused inode would be a new directory at the same path.
+        if let Some(expected) = self.directory_key {
             ensure!(
-                same_file(current, self.directory_key),
+                current.is_some_and(|current| current.same_object(expected)),
                 "output directory changed during conversion"
             );
         }
@@ -423,6 +430,9 @@ mod tests {
         assert!(same_file(key, key));
         assert!(!same_file(None, None));
         assert!(!same_file(key, None));
+        let touched = FileKey::new(7, 42, 1).unwrap();
+        assert!(!same_file(key, Some(touched)));
+        assert!(key.unwrap().same_object(touched));
     }
 
     #[cfg(target_os = "linux")]
