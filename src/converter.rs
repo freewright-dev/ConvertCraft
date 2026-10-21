@@ -5,9 +5,12 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Condvar, Mutex, PoisonError};
 
-use anyhow::{Context, Result, anyhow, bail};
-use image::{DynamicImage, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use image::{
+    DynamicImage, ImageDecoder, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType,
+};
 use serde_json::{Map, Value};
 
 use crate::output::OutputPlan;
@@ -134,12 +137,101 @@ pub fn convert(
 
 // ---------------------------------------------------------------- images
 
+/// Largest image converted. Normalizing to 8-bit RGB(A) allocates up to 4 bytes per
+/// pixel on top of the decoded buffer, which the `image` allocation limit does not cover.
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+/// Estimated memory shared by all concurrent image jobs.
+const IMAGE_MEMORY_BUDGET: u64 = 1536 * 1024 * 1024;
+/// Decoders accepted after content sniffing; matches the extensions in `detect`.
+const INPUT_IMAGE_FORMATS: [ImageFormat; 10] = [
+    ImageFormat::Png,
+    ImageFormat::Jpeg,
+    ImageFormat::WebP,
+    ImageFormat::Bmp,
+    ImageFormat::Gif,
+    ImageFormat::Tiff,
+    ImageFormat::Ico,
+    ImageFormat::Tga,
+    ImageFormat::Qoi,
+    ImageFormat::Pnm,
+];
+
+static IMAGE_MEMORY: MemoryBudget = MemoryBudget::new(IMAGE_MEMORY_BUDGET);
+
+/// Counting semaphore over bytes, so concurrent workers share one memory budget.
+struct MemoryBudget {
+    used: Mutex<u64>,
+    freed: Condvar,
+    limit: u64,
+}
+
+impl MemoryBudget {
+    const fn new(limit: u64) -> Self {
+        Self {
+            used: Mutex::new(0),
+            freed: Condvar::new(),
+            limit,
+        }
+    }
+
+    /// Blocks until `bytes` fit. A request larger than the whole budget waits until it
+    /// can run alone.
+    fn reserve(&self, bytes: u64) -> Reservation<'_> {
+        let bytes = bytes.min(self.limit);
+        let mut used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        while *used + bytes > self.limit {
+            used = self
+                .freed
+                .wait(used)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *used += bytes;
+        Reservation {
+            budget: self,
+            bytes,
+        }
+    }
+}
+
+struct Reservation<'a> {
+    budget: &'a MemoryBudget,
+    bytes: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *used -= self.bytes;
+        self.budget.freed.notify_all();
+    }
+}
+
 fn convert_image(input: &Path, output: &mut File, target: &str, opts: &Options) -> Result<()> {
-    let img = image::ImageReader::open(input)
+    // Content wins over the extension (a PNG named .jpg still converts), but only
+    // advertised formats are decoded.
+    let reader = image::ImageReader::open(input)
         .context("cannot open image")?
-        .with_guessed_format()?
-        .decode()
-        .context("cannot decode image")?;
+        .with_guessed_format()?;
+    let format = reader.format().context("unrecognized image format")?;
+    ensure!(
+        INPUT_IMAGE_FORMATS.contains(&format),
+        "unsupported image format: {format:?}"
+    );
+    let decoder = reader.into_decoder().context("cannot decode image")?;
+    let (width, height) = decoder.dimensions();
+    let pixels = u64::from(width) * u64::from(height);
+    ensure!(
+        pixels <= MAX_IMAGE_PIXELS,
+        "image is too large to convert ({width}×{height}; the limit is {} megapixels)",
+        MAX_IMAGE_PIXELS / 1_000_000
+    );
+    // Decoded buffer plus the 8-bit RGB(A) copy made before encoding.
+    let _memory = IMAGE_MEMORY.reserve(decoder.total_bytes().saturating_add(pixels * 4));
+    let img = DynamicImage::from_decoder(decoder).context("cannot decode image")?;
 
     let mut writer = BufWriter::new(output);
     match target {
@@ -431,6 +523,95 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{t}: {e:#}"));
             image::open(&out).unwrap_or_else(|e| panic!("reopen {t}: {e}"));
         }
+    }
+
+    /// A BMP header declaring `width`x`height` pixels, with no pixel data.
+    fn bmp_header(width: i32, height: i32) -> Vec<u8> {
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&54u32.to_le_bytes()); // file size (header only)
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
+        bmp.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+        bmp.extend_from_slice(&width.to_le_bytes());
+        bmp.extend_from_slice(&height.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bmp.extend_from_slice(&24u16.to_le_bytes()); // bits per pixel
+        bmp.extend_from_slice(&[0; 24]); // no compression, sizes, resolution, palette
+        bmp
+    }
+
+    #[test]
+    fn oversized_images_are_rejected_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("huge.bmp");
+        std::fs::write(&src, bmp_header(20_000, 20_000)).unwrap();
+        let error = convert_to(
+            &src,
+            dir.path(),
+            Category::Image,
+            "png",
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("too large"), "{error:#}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn undeclared_image_formats_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("photo.png");
+        // OpenEXR magic number followed by junk.
+        std::fs::write(&src, [0x76, 0x2f, 0x31, 0x01, 2, 0, 0, 0, 0, 0]).unwrap();
+        let error = convert_to(
+            &src,
+            dir.path(),
+            Category::Image,
+            "bmp",
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported image format: OpenExr"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn sniffed_supported_format_still_converts() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("actually-png.jpg");
+        image::RgbImage::new(4, 4)
+            .save_with_format(&src, ImageFormat::Png)
+            .unwrap();
+        convert_to(
+            &src,
+            dir.path(),
+            Category::Image,
+            "bmp",
+            &Options::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn memory_budget_blocks_until_released() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        static BUDGET: MemoryBudget = MemoryBudget::new(100);
+        let first = BUDGET.reserve(60);
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _second = BUDGET.reserve(60);
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+        // Oversized requests are clamped and run alone instead of deadlocking.
+        drop(BUDGET.reserve(1_000));
     }
 
     #[test]

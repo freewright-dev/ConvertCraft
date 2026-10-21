@@ -8,7 +8,9 @@ The extension lists and targets below come from `Category::targets` and `detect`
 
 **Output targets:** `png`, `jpg`, `webp`, `bmp`, `gif`, `tiff`, `ico`, `tga`, `qoi`.
 
-The `image` crate opens the input, guesses its format, and decodes a single image.
+The `image` crate opens the input, identifies its format from the file contents (falling back to the extension), and decodes a single image. The contents decide the decoder, so a PNG named `.jpg` still converts, but only the input formats listed above are accepted: other formats the `image` crate can identify, such as OpenEXR, HDR, or DDS, are rejected with `unsupported image format`, and their decoders are not built into ConvertCraft.
+
+Images larger than **100 megapixels** (for example 10,000×10,000) are rejected before their pixels are decoded. Normalizing to 8-bit RGB(A) needs up to 4 bytes per pixel on top of the decoded image, so all running image jobs share an estimated memory budget of 1.5 GiB; a job waits for memory instead of running alongside the others when the budget is full.
 
 - **JPG:** converts to 8-bit RGB and encodes at the selected quality (90 by default). Alpha is discarded, not composited over a configurable background.
 - **PNG:** saves the decoded image as PNG without the explicit RGBA8 normalization used by the other non-JPEG targets.
