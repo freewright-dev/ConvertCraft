@@ -32,6 +32,7 @@ The initial target is the first supported target that differs from the input ext
 - **Choose folder…:** put all outputs directly in one folder; the source directory hierarchy is not reproduced.
 - **JPEG quality:** 10–100, default 90; affects JPG output only.
 - **Overwrite existing files:** disabled by default. Enable only if replacing existing output files is acceptable.
+- **Safe CSV for spreadsheets:** enabled by default. CSV cells that start with `=`, `+`, `-`, `@`, tab, or carriage return get an apostrophe prefix so Excel, LibreOffice, or Google Sheets do not run them as formulas. Disable it when the CSV must contain those values unchanged.
 
 With overwriting disabled, an existing `photo.png` leads to names such as `photo (1).png`, `photo (2).png`, and so on. The planner reserves names conservatively across the batch and protects every queued input, including case and hard-link aliases. Destination links and special files are skipped even when overwriting is enabled.
 
@@ -67,7 +68,7 @@ Images are decoded according to their contents. `unsupported image format` means
 
 ### TOML or CSV conversion fails or changes values
 
-TOML cannot represent null values. CSV output requires an object or an array of objects. CSV input infers numbers and booleans, treats empty fields as null, and can lose leading zeroes in identifiers. See the [data rules](formats.md#structured-data).
+TOML cannot represent null values. CSV output requires an object or an array of objects. CSV input infers numbers and booleans and treats empty fields as null; integers with leading zeros or beyond 64 bits stay text. Duplicate keys or CSV headers are rejected. Files over 64 MiB, or documents that expand beyond the memory limit, are refused. See the [data rules](formats.md#structured-data).
 
 ### Output cannot be written
 

@@ -297,6 +297,15 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.opts.jpeg_quality, 10..=100));
                 ui.separator();
                 ui.checkbox(&mut self.opts.overwrite, "Overwrite existing files");
+                ui.separator();
+                ui.checkbox(
+                    &mut self.opts.csv_formula_guard,
+                    "Safe CSV for spreadsheets",
+                )
+                .on_hover_text(
+                    "Prefix CSV cells starting with = + - @ tab or CR with an apostrophe \
+                         so spreadsheets show them as text instead of running them as formulas",
+                );
             });
         });
         ui.add_space(4.0);

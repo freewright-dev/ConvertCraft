@@ -27,6 +27,10 @@ There are no controls for image dimensions, metadata, color profiles, WebP quali
 
 Inputs are read as UTF-8 text and parsed into a `serde_json::Value`. The target serializer then writes that value. Original formatting, comments, and format-specific features are not preserved; conversions are not guaranteed to be lossless.
 
+Duplicate keys in JSON or YAML objects, and duplicate CSV header names, are rejected with a `duplicate key` / `duplicate CSV header` error instead of silently keeping one value.
+
+**Size limits.** Data files larger than 64 MiB are rejected. While parsing, the estimated in-memory size of the document is capped at 768 MiB, which stops YAML aliases or very wide CSV headers from expanding a small file into gigabytes (`document expands beyond the 768 MiB memory limit`). Output is written directly to the staged file and capped at 1 GiB. CSV input and output are limited to 16,384 columns (the Excel column limit).
+
 ### JSON and YAML
 
 JSON output is pretty-printed and ends with a newline. YAML uses `serde_yaml` serialization. Because the intermediate value is JSON-shaped, source features outside that data model may fail or change representation.
@@ -56,12 +60,14 @@ The first record supplies headers. Each remaining record becomes an object in an
 Each field is inferred in this order:
 
 1. Empty string → null.
-2. Valid signed 64-bit integer → number.
-3. Valid finite floating-point number → number.
-4. Exact lowercase `true` or `false` → boolean.
-5. Anything else → string.
+2. Integer with a leading zero (`00123`, `-007`) → string, so identifiers keep their formatting.
+3. Valid signed or unsigned 64-bit integer → number.
+4. Other integer text (too large for 64 bits) → string, so it is not rounded.
+5. Valid finite floating-point number (`0.5`, `1e3`) → number.
+6. Exact lowercase `true` or `false` → boolean.
+7. Anything else → string.
 
-For example, `00123` becomes the number `123`; quoting a CSV field does not disable inference. Duplicate header names collapse into object keys rather than remaining separate columns.
+For example, `00123` stays the string `"00123"` and `18446744073709551615` stays an exact integer. Quoting a CSV field does not disable inference.
 
 ### CSV output
 
@@ -72,7 +78,9 @@ The root must be one object or an array containing only objects. Headers are the
 - Numbers and booleans use their JSON text representation.
 - Nested objects and arrays become JSON text inside a field, not flattened columns.
 
-Nested JSON text is not automatically parsed back into nested values when reading CSV. Empty strings, nulls, and missing values can become indistinguishable. CSV output is not sanitized against spreadsheet formula interpretation; treat untrusted values cautiously when opening it in a spreadsheet program.
+Nested JSON text is not automatically parsed back into nested values when reading CSV. Empty strings, nulls, and missing values can become indistinguishable.
+
+**Safe CSV for spreadsheets** (on by default) prefixes headers and string cells that begin with `=`, `+`, `-`, `@`, tab, or carriage return with an apostrophe, so spreadsheet programs show them as text instead of evaluating them as formulas. Numbers are not changed. Turn the option off to write such values unmodified, for example when the CSV is consumed by another program rather than a spreadsheet.
 
 ## Audio
 
