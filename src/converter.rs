@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -133,11 +133,17 @@ pub fn convert(
     if !cat.targets().contains(&target) {
         bail!("unsupported {} target: {target}", cat.label());
     }
+    // Fails if the source was replaced after planning.
+    let source = output.open_source(input)?;
     let mut staged = output.begin()?;
     match cat {
-        Category::Image => convert_image(input, staged.file_mut(), target, opts)?,
-        Category::Data => convert_data(input, staged.file_mut(), target, opts)?,
-        Category::Audio | Category::Video => convert_media(input, staged.path(), target)?,
+        Category::Image => convert_image(input, source, staged.file_mut(), target, opts)?,
+        Category::Data => convert_data(input, source, staged.file_mut(), target, opts)?,
+        Category::Audio | Category::Video => {
+            // FFmpeg reopens the path itself; the check above ran just before.
+            drop(source);
+            convert_media(input, staged.path(), target)?;
+        }
     }
     staged.commit()
 }
@@ -217,12 +223,21 @@ impl Drop for Reservation<'_> {
     }
 }
 
-fn convert_image(input: &Path, output: &mut File, target: &str, opts: &Options) -> Result<()> {
+fn convert_image(
+    input: &Path,
+    source: File,
+    output: &mut File,
+    target: &str,
+    opts: &Options,
+) -> Result<()> {
     // Content wins over the extension (a PNG named .jpg still converts), but only
     // advertised formats are decoded.
-    let reader = image::ImageReader::open(input)
-        .context("cannot open image")?
-        .with_guessed_format()?;
+    let mut reader = image::ImageReader::new(BufReader::new(source));
+    // The extension is the fallback for formats without a signature, such as TGA.
+    if let Ok(format) = ImageFormat::from_path(input) {
+        reader.set_format(format);
+    }
+    let reader = reader.with_guessed_format()?;
     let format = reader.format().context("unrecognized image format")?;
     ensure!(
         INPUT_IMAGE_FORMATS.contains(&format),
@@ -296,10 +311,15 @@ const MAX_CSV_COLUMNS: usize = 16_384;
 /// Rough per-node cost of a `serde_json::Value`, charged on top of string bytes.
 const VALUE_NODE_BYTES: u64 = 64;
 
-fn convert_data(input: &Path, output: &mut File, target: &str, opts: &Options) -> Result<()> {
+fn convert_data(
+    input: &Path,
+    source: File,
+    output: &mut File,
+    target: &str,
+    opts: &Options,
+) -> Result<()> {
     let mut text = String::new();
-    File::open(input)
-        .context("cannot read file")?
+    source
         .take(MAX_DATA_INPUT_BYTES + 1)
         .read_to_string(&mut text)
         .context("cannot read file")?;
@@ -747,7 +767,10 @@ mod tests {
         target: &str,
         opts: &Options,
     ) -> Result<PathBuf> {
-        let mut planner = OutputPlanner::new([input])?;
+        let (mut planner, errors) = OutputPlanner::new([input]);
+        if let Some((_, error)) = errors.into_iter().next() {
+            return Err(error);
+        }
         let plan = planner.plan(input, Some(directory), target, opts.overwrite)?;
         convert(input, plan, cat, target, opts)
     }
@@ -1080,7 +1103,8 @@ mod tests {
         let yaml = dir.path().join("batch.yaml");
         std::fs::write(&json, r#"{"origin":"A"}"#).unwrap();
         std::fs::write(&yaml, "origin: B\n").unwrap();
-        let mut planner = OutputPlanner::new([json.as_path(), yaml.as_path()]).unwrap();
+        let (mut planner, errors) = OutputPlanner::new([json.as_path(), yaml.as_path()]);
+        assert!(errors.is_empty());
         let json_plan = planner.plan(&json, None, "yaml", true).unwrap();
         let yaml_plan = planner.plan(&yaml, None, "json", true).unwrap();
         let opts = Options {

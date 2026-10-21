@@ -5,7 +5,7 @@ mod converter;
 mod import;
 mod output;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -263,22 +263,18 @@ impl App {
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        let mut planner =
-            match output::OutputPlanner::new(self.files.iter().map(|file| file.path.as_path())) {
-                Ok(planner) => planner,
-                Err(error) => {
-                    for file in &mut self.files {
-                        if !matches!(file.status, Status::Done(_)) {
-                            file.status =
-                                Status::Failed(format!("cannot protect batch inputs: {error:#}"));
-                        }
-                    }
-                    return;
-                }
-            };
+        // Every queued source is protected, including completed rows. A source that
+        // cannot be inspected fails only its own row (and is ignored if already done).
+        let (mut planner, errors) =
+            output::OutputPlanner::new(self.files.iter().map(|file| file.path.as_path()));
+        let mut errors: HashMap<usize, anyhow::Error> = errors.into_iter().collect();
         let mut jobs = Vec::new();
         for (idx, f) in self.files.iter_mut().enumerate() {
             if matches!(f.status, Status::Done(_)) {
+                continue;
+            }
+            if let Some(error) = errors.remove(&idx) {
+                f.status = Status::Failed(format!("{error:#}"));
                 continue;
             }
             if f.category.needs_ffmpeg() && !self.ffmpeg {

@@ -30,6 +30,10 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Fixed
 
+- Batches no longer keep two open handles per queued job: source and destination identities are stored as keys, so large batches no longer run into the Unix open-file limit (#17).
+- A missing, unreadable, or non-regular source fails only its own row instead of the whole batch; completed rows whose sources were deleted no longer block new conversions (#16).
+- File systems that report no file ID are detected, and overwrite then uses a numbered name instead of replacing a file it cannot re-identify (#26).
+- Sources are opened once and re-identified before conversion, so a file or FIFO swapped in after planning is rejected instead of converted or blocking a worker (#27).
 - Images over 100 megapixels are rejected before decoding, and concurrent image jobs share a 1.5 GiB memory budget; a 260 KB PNG could previously drive one conversion to 1.35 GB of memory and a 1 GiB output (#14).
 - Only the advertised image input formats are decoded. The `image` crate is built without its EXR, HDR, DDS, farbfeld, and AVIF support, and files sniffed as other formats are rejected (#21).
 - Data conversion is bounded: 64 MiB input limit, a 768 MiB estimated memory budget enforced while parsing (stops YAML alias and wide-CSV-header expansion), output streamed to disk with a 1 GiB limit, and at most 16,384 CSV columns. The CSV header union is no longer quadratic (#13).
