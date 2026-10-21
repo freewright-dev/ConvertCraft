@@ -1,0 +1,13 @@
+[package]
+name = "convertcraft-file-id"
+version = "0.1.0"
+edition = "2024"
+description = "Safe wrapper for the Windows 128-bit file ID, used by ConvertCraft"
+license = "GPL-3.0-only"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"

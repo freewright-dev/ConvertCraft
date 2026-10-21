@@ -6,15 +6,21 @@ description = "Local desktop batch converter for images, structured data, audio,
 repository = "https://github.com/freewright-dev/ConvertCraft"
 license = "GPL-3.0-only"
 
+[workspace]
+members = ["crates/file-id"]
+
 [dependencies]
 anyhow = "1"
 csv = "1"
-eframe = "0.31"
+# Keep the OpenGL (glow) renderer; eframe 0.37 switched its default to wgpu.
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
+# Emoji glyphs used by the UI (➕ 📁 ✔ ✖) are no longer bundled by default.
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "qoi", "rayon", "tga", "tiff", "webp"] }
-rfd = "0.15"
+rfd = "0.17"
 serde = "1"
 serde_json = "1"
-serde_yaml = "0.9"
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize", "serialize"] }
 tempfile = "3"
 toml = "0.8"
 
@@ -22,4 +28,4 @@ toml = "0.8"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-winapi-util = "0.1"
+convertcraft-file-id = { path = "crates/file-id", version = "0.1" }

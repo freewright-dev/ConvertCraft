@@ -33,7 +33,7 @@ Duplicate keys in JSON or YAML objects, and duplicate CSV header names, are reje
 
 ### JSON and YAML
 
-JSON output is pretty-printed and ends with a newline. YAML uses `serde_yaml` serialization. Because the intermediate value is JSON-shaped, source features outside that data model may fail or change representation.
+JSON output is pretty-printed and ends with a newline. YAML is parsed and written with `serde-saphyr`, a pure-Rust YAML library. Nesting deeper than 128 levels is rejected, as for JSON. Because the intermediate value is JSON-shaped, source features outside that data model may fail or change representation.
 
 ### TOML
 

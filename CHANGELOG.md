@@ -31,6 +31,9 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Fixed
 
+- Output planning runs on a background thread, so a slow network share or an output folder crowded with numbered names no longer freezes the window (#24).
+- Windows file identity uses the 128-bit file ID (`FILE_ID_INFO`) instead of the 64-bit index, which is not unique on ReFS; volumes that cannot report it get an unknown identity and existing files there are never replaced (#26).
+- Upgraded eframe to 0.37, which drops the `quick-xml 0.30` advisories (RUSTSEC-2026-0194/-0195) and the unmaintained `paste` and `ttf-parser`, and replaced `serde_yaml`/`unsafe-libyaml` with the maintained pure-Rust `serde-saphyr` (#20).
 - A panic during a conversion fails only that row, and rows left unfinished by exiting workers are marked failed instead of staying "Converting…" forever. Closing the window stops FFmpeg and waits briefly for workers to clean up their staging files (#22).
 - FFmpeg runs with a demuxer whitelist (no HLS/ffconcat playlists), `-protocol_whitelist file`, and `-nostdin`; a job with no progress for 5 minutes is stopped; stderr capture is capped at 64 KiB (#23).
 - FFmpeg is located only in absolute `PATH` entries, and Explorer is launched by absolute path, so executables placed next to ConvertCraft are not run (#19).

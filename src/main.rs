@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -80,6 +80,111 @@ struct Job {
     target: &'static str,
 }
 
+/// A queued row as it was when Convert was clicked.
+struct Row {
+    idx: usize,
+    category: Category,
+    target: &'static str,
+}
+
+/// Everything a batch needs, moved to its own thread so planning (path resolution,
+/// directory creation, and output-name probing) never blocks the window.
+struct Batch {
+    /// Every queued source, including completed rows, by row index.
+    inputs: Vec<PathBuf>,
+    rows: Vec<Row>,
+    out_dir: Option<PathBuf>,
+    opts: Options,
+    cancel: Arc<AtomicBool>,
+    ctx: egui::Context,
+}
+
+impl Batch {
+    fn run(self, tx: Sender<Msg>) {
+        let jobs = self.plan(&tx);
+        let workers = thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .min(4)
+            .min(jobs.len());
+        let queue = Mutex::new(jobs);
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                scope.spawn(|| self.work(&queue, tx));
+            }
+        });
+    }
+
+    /// Rows that cannot be planned finish at once with their error.
+    fn plan(&self, tx: &Sender<Msg>) -> Vec<Job> {
+        // Every queued source is protected, including completed rows. A source that
+        // cannot be inspected fails only its own row (and is ignored if already done).
+        let (mut planner, errors) =
+            output::OutputPlanner::new(self.inputs.iter().map(PathBuf::as_path));
+        let mut errors: HashMap<usize, anyhow::Error> = errors.into_iter().collect();
+        let mut jobs = Vec::new();
+        for row in &self.rows {
+            if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let input = &self.inputs[row.idx];
+            let planned = if let Some(error) = errors.remove(&row.idx) {
+                Err(format!("{error:#}"))
+            } else if row.category.needs_ffmpeg() && converter::ffmpeg_path().is_none() {
+                Err("ffmpeg not found on PATH".into())
+            } else {
+                planner
+                    .plan(
+                        input,
+                        self.out_dir.as_deref(),
+                        row.target,
+                        self.opts.overwrite,
+                    )
+                    .map_err(|error| format!("{error:#}"))
+            };
+            match planned {
+                Ok(output) => jobs.push(Job {
+                    idx: row.idx,
+                    input: input.clone(),
+                    output,
+                    category: row.category,
+                    target: row.target,
+                }),
+                Err(error) => {
+                    let _ = tx.send(Msg::Finished(row.idx, Err(error)));
+                    self.ctx.request_repaint();
+                }
+            }
+        }
+        jobs.reverse(); // workers pop from the end; keep list order
+        jobs
+    }
+
+    fn work(&self, queue: &Mutex<Vec<Job>>, tx: Sender<Msg>) {
+        while !self.cancel.load(Ordering::Relaxed) {
+            let job = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let Some(job) = job else {
+                break;
+            };
+            let _ = tx.send(Msg::Started(job.idx));
+            self.ctx.request_repaint();
+            let result = catch_panic(|| {
+                converter::convert(
+                    &job.input,
+                    job.output,
+                    job.category,
+                    job.target,
+                    &self.opts,
+                    &self.cancel,
+                )
+            })
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Finished(job.idx, result));
+            self.ctx.request_repaint();
+        }
+    }
+}
+
 /// A folder/file import running on a background thread.
 struct Import {
     rx: Receiver<import::Event>,
@@ -116,7 +221,8 @@ struct App {
     opts: Options,
     rx: Option<Receiver<Msg>>,
     cancel: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
+    /// Plans the batch, then runs and joins its workers.
+    batch: Option<JoinHandle<()>>,
     total: usize,
     finished: usize,
     import: Option<Import>,
@@ -138,7 +244,7 @@ impl App {
             opts: Options::default(),
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
-            workers: Vec::new(),
+            batch: None,
             total: 0,
             finished: 0,
             import: None,
@@ -275,91 +381,42 @@ impl App {
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        // Every queued source is protected, including completed rows. A source that
-        // cannot be inspected fails only its own row (and is ignored if already done).
-        let (mut planner, errors) =
-            output::OutputPlanner::new(self.files.iter().map(|file| file.path.as_path()));
-        let mut errors: HashMap<usize, anyhow::Error> = errors.into_iter().collect();
-        let mut jobs = Vec::new();
+        let mut rows = Vec::new();
         for (idx, f) in self.files.iter_mut().enumerate() {
             if matches!(f.status, Status::Done(_)) {
                 continue;
             }
-            if let Some(error) = errors.remove(&idx) {
-                f.status = Status::Failed(format!("{error:#}"));
-                continue;
-            }
-            if f.category.needs_ffmpeg() && converter::ffmpeg_path().is_none() {
-                f.status = Status::Failed("ffmpeg not found on PATH".into());
-                continue;
-            }
-            let output = match planner.plan(
-                &f.path,
-                self.out_dir.as_deref(),
-                f.target,
-                self.opts.overwrite,
-            ) {
-                Ok(output) => output,
-                Err(error) => {
-                    f.status = Status::Failed(format!("{error:#}"));
-                    continue;
-                }
-            };
             f.status = Status::Pending;
-            jobs.push(Job {
+            rows.push(Row {
                 idx,
-                input: f.path.clone(),
-                output,
                 category: f.category,
                 target: f.target,
             });
         }
-        if jobs.is_empty() {
+        if rows.is_empty() {
             return;
         }
 
-        self.total = jobs.len();
+        self.total = rows.len();
         self.finished = 0;
-        jobs.reverse(); // workers pop from the end; keep list order
-        let queue = Arc::new(Mutex::new(jobs));
-        let (tx, rx) = mpsc::channel();
-        let workers = thread::available_parallelism()
-            .map_or(2, |n| n.get())
-            .min(4);
         self.cancel = Arc::new(AtomicBool::new(false));
-
-        self.workers = (0..workers)
-            .map(|_| {
-                let queue = Arc::clone(&queue);
-                let tx = tx.clone();
-                let ctx = ctx.clone();
-                let opts = self.opts.clone();
-                let cancel = Arc::clone(&self.cancel);
-                thread::spawn(move || {
-                    while !cancel.load(Ordering::Relaxed) {
-                        let job = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
-                        let Some(job) = job else {
-                            break;
-                        };
-                        let _ = tx.send(Msg::Started(job.idx));
-                        ctx.request_repaint();
-                        let result = catch_panic(|| {
-                            converter::convert(
-                                &job.input,
-                                job.output,
-                                job.category,
-                                job.target,
-                                &opts,
-                                &cancel,
-                            )
-                        })
-                        .map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(Msg::Finished(job.idx, result));
-                        ctx.request_repaint();
-                    }
-                })
-            })
-            .collect();
+        let batch = Batch {
+            inputs: self.files.iter().map(|f| f.path.clone()).collect(),
+            rows,
+            out_dir: self.out_dir.clone(),
+            opts: self.opts.clone(),
+            cancel: Arc::clone(&self.cancel),
+            ctx: ctx.clone(),
+        };
+        // The queue stays locked until every sender is gone, so row indexes stay valid.
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        self.batch = Some(thread::spawn(move || {
+            // A panic outside a conversion still ends the batch; `poll` then fails
+            // the unfinished rows.
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| batch.run(tx)));
+            ctx.request_repaint();
+        }));
         self.rx = Some(rx);
     }
 
@@ -398,7 +455,7 @@ impl App {
                         }
                     }
                     self.rx = None;
-                    self.workers.clear();
+                    self.batch = None;
                     break;
                 }
             }
@@ -675,7 +732,8 @@ impl App {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
+                .filter(|path| !path.as_os_str().is_empty())
                 .collect()
         });
         if !self.busy() {
@@ -685,9 +743,9 @@ impl App {
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("drop"),
+                egui::Id::unique("drop"),
             ));
-            let rect = ctx.screen_rect();
+            let rect = ctx.viewport_rect();
             painter.rect_filled(rect, 0.0, Color32::from_black_alpha(160));
             painter.text(
                 rect.center(),
@@ -701,18 +759,21 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
         self.poll_import();
-        self.handle_drops(ctx);
+    }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_drops(ui.ctx());
+
+        egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             self.top_bar(ui);
             ui.add_space(4.0);
         });
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_bar(ui));
-        egui::CentralPanel::default().show(ctx, |ui| self.file_list(ui));
+        egui::Panel::bottom("bottom").show(ui, |ui| self.bottom_bar(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.file_list(ui));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -720,7 +781,7 @@ impl eframe::App for App {
         // process exits; image/data jobs cannot be interrupted, so wait briefly.
         self.cancel();
         let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while self.workers.iter().any(|w| !w.is_finished()) && Instant::now() < deadline {
+        while self.batch.as_ref().is_some_and(|b| !b.is_finished()) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
         }
     }

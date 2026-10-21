@@ -17,18 +17,20 @@ const MAX_NAME_ATTEMPTS: usize = 10_000;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FileKey {
     volume: u64,
-    index: u64,
+    /// Unix inode number, or the Windows 128-bit file ID. The 64-bit `nFileIndex` is
+    /// not unique on ReFS and may be zero or reused on network and FAT redirectors.
+    index: u128,
     /// Unix inode change time in nanoseconds (0 on Windows). Without an open handle an
     /// inode number can be reused by a new file right after deletion; the new file has
-    /// a fresh change time. NTFS file indexes already carry a reuse sequence number.
+    /// a fresh change time. NTFS file IDs already carry a reuse sequence number.
     changed: i64,
 }
 
 impl FileKey {
     /// `None` when the file system reports no usable file ID (some network and FAT
     /// redirectors report 0); identity checks then fail safe.
-    fn new(volume: u64, index: u64, changed: i64) -> Option<Self> {
-        (index != 0).then_some(Self {
+    fn new(volume: u64, index: u128, changed: i64) -> Option<Self> {
+        (index != 0 && index != u128::MAX).then_some(Self {
             volume,
             index,
             changed,
@@ -47,7 +49,15 @@ impl FileKey {
             .ctime()
             .saturating_mul(1_000_000_000)
             .saturating_add(metadata.ctime_nsec());
-        Self::new(metadata.dev(), metadata.ino(), changed)
+        Self::new(metadata.dev(), metadata.ino().into(), changed)
+    }
+
+    /// A file system that cannot report a 128-bit file ID gets no identity, so
+    /// existing files there are never replaced and identity checks fail safe.
+    #[cfg(windows)]
+    fn from_handle(file: &File) -> Option<Self> {
+        let id = convertcraft_file_id::file_id(file).ok()?;
+        Self::new(id.volume, id.id, 0)
     }
 
     fn of_path(path: &Path) -> io::Result<Option<Self>> {
@@ -57,9 +67,14 @@ impl FileKey {
         }
         #[cfg(windows)]
         {
-            let handle = winapi_util::Handle::from_path_any(path)?;
-            let info = winapi_util::file::information(&handle)?;
-            Ok(Self::new(info.volume_serial_number(), info.file_index(), 0))
+            use std::os::windows::fs::OpenOptionsExt;
+            // Needed to open directories as well as files.
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)?;
+            Ok(Self::from_handle(&file))
         }
     }
 
@@ -70,8 +85,7 @@ impl FileKey {
         }
         #[cfg(windows)]
         {
-            let info = winapi_util::file::information(winapi_util::HandleRef::from_file(file))?;
-            Ok(Self::new(info.volume_serial_number(), info.file_index(), 0))
+            Ok(Self::from_handle(file))
         }
     }
 }
@@ -426,6 +440,7 @@ mod tests {
     #[test]
     fn unknown_file_ids_never_compare_equal() {
         assert_eq!(FileKey::new(7, 0, 0), None);
+        assert_eq!(FileKey::new(7, u128::MAX, 0), None);
         let key = FileKey::new(7, 42, 0);
         assert!(same_file(key, key));
         assert!(!same_file(None, None));
