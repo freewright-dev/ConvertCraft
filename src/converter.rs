@@ -4,11 +4,15 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use image::{
@@ -129,6 +133,7 @@ pub fn convert(
     cat: Category,
     target: &str,
     opts: &Options,
+    cancel: &AtomicBool,
 ) -> Result<PathBuf> {
     if !cat.targets().contains(&target) {
         bail!("unsupported {} target: {target}", cat.label());
@@ -142,7 +147,7 @@ pub fn convert(
         Category::Audio | Category::Video => {
             // FFmpeg reopens the path itself; the check above ran just before.
             drop(source);
-            convert_media(input, staged.path(), target)?;
+            convert_media(input, staged.path(), target, cancel)?;
         }
     }
     staged.commit()
@@ -643,26 +648,89 @@ impl<W: Write> Write for LimitedWriter<W> {
 
 // ---------------------------------------------------------------- audio / video
 
+/// Demuxers for the advertised audio/video inputs. Playlist and concat demuxers (HLS,
+/// ffconcat) that could pull other local files into the output are not on the list.
+const MEDIA_DEMUXERS: &str = "aac,aiff,asf,avi,flac,flv,matroska,mov,mp3,mpeg,mpegts,ogg,wav";
+/// FFmpeg reports progress about twice a second; a job silent this long is stuck.
+const FFMPEG_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Only the end of FFmpeg's error output is shown, so only the end is kept.
+const MAX_FFMPEG_STDERR: usize = 64 * 1024;
+
+static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Locate and check FFmpeg once per process (blocking on first call).
+pub fn ffmpeg_path() -> Option<&'static Path> {
+    FFMPEG.get_or_init(locate_ffmpeg).as_deref()
+}
+
+/// `None` while the startup check is still running.
+pub fn ffmpeg_status() -> Option<Option<&'static Path>> {
+    FFMPEG.get().map(Option::as_deref)
+}
+
+/// Candidate executables from absolute PATH entries only. Unlike `Command::new`, this
+/// never picks up an `ffmpeg` that sits next to the application or in the working
+/// directory.
+fn ffmpeg_candidates(path_var: &OsStr) -> impl Iterator<Item = PathBuf> + '_ {
+    let name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
+        .map(move |dir| dir.join(name))
+}
+
+fn locate_ffmpeg() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let ffmpeg = ffmpeg_candidates(&path_var).find(|candidate| candidate.is_file())?;
+    let works = ffmpeg_command(&ffmpeg)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    works.then_some(ffmpeg)
+}
+
+/// Stop FFmpeg and anything it started. Package managers such as Chocolatey put a
+/// shim `ffmpeg.exe` on PATH that runs the real one as a child; killing only the shim
+/// would leave the real encoder running and holding the staged output open.
+fn kill_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let windows = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        // Must run while the parent is alive: /T finds children through it.
+        let _ = Command::new(windows.join("System32").join("taskkill.exe"))
+            .args(["/T", "/F", "/PID"])
+            .arg(child.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[cfg(windows)]
-fn ffmpeg_command() -> Command {
+fn ffmpeg_command(ffmpeg: &Path) -> Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg);
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
 }
 
 #[cfg(not(windows))]
-fn ffmpeg_command() -> Command {
-    Command::new("ffmpeg")
-}
-
-pub fn ffmpeg_available() -> bool {
-    ffmpeg_command()
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+fn ffmpeg_command(ffmpeg: &Path) -> Command {
+    Command::new(ffmpeg)
 }
 
 fn ffmpeg_args(target: &str) -> &'static [&'static str] {
@@ -723,23 +791,89 @@ fn ffmpeg_args(target: &str) -> &'static [&'static str] {
     }
 }
 
-fn convert_media(input: &Path, output: &Path, target: &str) -> Result<()> {
-    let result = ffmpeg_command()
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+fn convert_media(input: &Path, output: &Path, target: &str, cancel: &AtomicBool) -> Result<()> {
+    let ffmpeg = ffmpeg_path()
+        .context("ffmpeg was not found on PATH — install it to convert audio/video")?;
+    let mut child = ffmpeg_command(ffmpeg)
+        .args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"])
+        .args(["-progress", "pipe:1"])
+        .args([
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            MEDIA_DEMUXERS,
+        ])
+        .arg("-i")
         .arg(input)
         .args(ffmpeg_args(target))
         .arg(output)
-        .output();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run ffmpeg")?;
 
-    let out = match result {
-        Ok(out) => out,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("ffmpeg was not found on PATH — install it to convert audio/video")
-        }
-        Err(e) => return Err(e).context("failed to run ffmpeg"),
+    // Progress lines on stdout show the job is alive; stderr keeps only its tail.
+    let started = Instant::now();
+    let last_progress = Arc::new(AtomicU64::new(0));
+    let stdout = child.stdout.take().context("ffmpeg stdout")?;
+    let progress = {
+        let last_progress = Arc::clone(&last_progress);
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.is_err() {
+                    break;
+                }
+                let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                last_progress.store(elapsed, Ordering::Relaxed);
+            }
+        })
     };
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut stderr = child.stderr.take().context("ffmpeg stderr")?;
+    let errors = thread::spawn(move || {
+        let mut tail = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(read) = stderr.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            tail.extend_from_slice(&chunk[..read]);
+            if tail.len() > MAX_FFMPEG_STDERR {
+                tail.drain(..tail.len() - MAX_FFMPEG_STDERR);
+            }
+        }
+        tail
+    });
+
+    let stopped = loop {
+        if let Some(status) = child.try_wait().context("failed to wait for ffmpeg")? {
+            break Ok(status);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            break Err(anyhow!("cancelled"));
+        }
+        let since_progress = started
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last_progress.load(Ordering::Relaxed)));
+        if since_progress > FFMPEG_STALL_TIMEOUT {
+            break Err(anyhow!(
+                "ffmpeg made no progress for {} minutes",
+                FFMPEG_STALL_TIMEOUT.as_secs() / 60
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let status = match stopped {
+        Ok(status) => status,
+        Err(error) => {
+            kill_tree(&mut child);
+            return Err(error);
+        }
+    };
+    let _ = progress.join();
+    let tail = errors.join().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&tail);
         let msg = stderr
             .lines()
             .rev()
@@ -772,7 +906,7 @@ mod tests {
             return Err(error);
         }
         let plan = planner.plan(input, Some(directory), target, opts.overwrite)?;
-        convert(input, plan, cat, target, opts)
+        convert(input, plan, cat, target, opts, &AtomicBool::new(false))
     }
 
     #[test]
@@ -1111,8 +1245,9 @@ mod tests {
             overwrite: true,
             ..Options::default()
         };
-        let a = convert(&json, json_plan, Category::Data, "yaml", &opts).unwrap();
-        let b = convert(&yaml, yaml_plan, Category::Data, "json", &opts).unwrap();
+        let no_cancel = AtomicBool::new(false);
+        let a = convert(&json, json_plan, Category::Data, "yaml", &opts, &no_cancel).unwrap();
+        let b = convert(&yaml, yaml_plan, Category::Data, "json", &opts, &no_cancel).unwrap();
         assert_eq!(std::fs::read_to_string(json).unwrap(), r#"{"origin":"A"}"#);
         assert_eq!(std::fs::read_to_string(yaml).unwrap(), "origin: B\n");
         assert_eq!(std::fs::read_to_string(a).unwrap(), "origin: A\n");
@@ -1122,7 +1257,7 @@ mod tests {
 
     #[test]
     fn failed_ffmpeg_conversion_preserves_existing_output() {
-        if !ffmpeg_available() {
+        if ffmpeg_path().is_none() {
             require_unset("CONVERTCRAFT_REQUIRE_FFMPEG", "ffmpeg is unavailable");
             eprintln!("skipping FFmpeg failure test: ffmpeg is unavailable");
             return;
@@ -1142,14 +1277,132 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_lookup_ignores_relative_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_var =
+            std::env::join_paths([Path::new("relative"), Path::new("."), dir.path()]).unwrap();
+        let candidates: Vec<PathBuf> = ffmpeg_candidates(&path_var).collect();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].starts_with(dir.path()));
+    }
+
+    /// Generate a short sample in `dir` for one media input extension.
+    fn media_fixture(dir: &Path, ext: &str) -> PathBuf {
+        let path = dir.join(format!("sample.{ext}"));
+        let video = !matches!(
+            ext,
+            "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "opus" | "wma" | "aiff" | "aif"
+        );
+        let mut cmd = ffmpeg_command(ffmpeg_path().unwrap());
+        cmd.args(["-y", "-loglevel", "error"]);
+        if video {
+            cmd.args(["-f", "lavfi", "-i", "testsrc=duration=1:size=64x48:rate=10"]);
+        }
+        cmd.args(["-f", "lavfi", "-i", "sine=duration=1"]);
+        if matches!(ext, "mpg" | "mpeg") {
+            cmd.args(["-c:v", "mpeg2video", "-c:a", "mp2"]);
+        }
+        let ok = cmd.arg("-shortest").arg(&path).status().unwrap().success();
+        assert!(ok, "cannot generate {ext} fixture");
+        path
+    }
+
+    #[test]
+    fn every_media_input_extension_passes_the_demuxer_whitelist() {
+        if ffmpeg_path().is_none() {
+            require_unset("CONVERTCRAFT_REQUIRE_FFMPEG", "ffmpeg is unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for ext in [
+            "mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma", "aiff", "aif", "mp4", "mkv",
+            "webm", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg", "ts",
+        ] {
+            let src = media_fixture(dir.path(), ext);
+            let cat = detect(&src).unwrap();
+            let out = dir.path().join(format!("out-{ext}"));
+            convert_to(&src, &out, cat, "wav", &Options::default())
+                .unwrap_or_else(|e| panic!("{ext}: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn playlists_disguised_as_media_are_rejected() {
+        if ffmpeg_path().is_none() {
+            require_unset("CONVERTCRAFT_REQUIRE_FFMPEG", "ffmpeg is unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let secret = media_fixture(dir.path(), "ts");
+        let playlists = [
+            format!(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n{}\n#EXT-X-ENDLIST\n",
+                secret.display()
+            ),
+            format!("ffconcat version 1.0\nfile '{}'\n", secret.display()),
+        ];
+        for (i, playlist) in playlists.iter().enumerate() {
+            let src = dir.path().join(format!("playlist{i}.mp4"));
+            std::fs::write(&src, playlist).unwrap();
+            let out = dir.path().join(format!("out{i}"));
+            assert!(
+                convert_to(&src, &out, Category::Video, "wav", &Options::default()).is_err(),
+                "playlist {i} was converted"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_stops_ffmpeg_and_publishes_nothing() {
+        if ffmpeg_path().is_none() {
+            require_unset("CONVERTCRAFT_REQUIRE_FFMPEG", "ffmpeg is unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("long.mp4");
+        let ok = ffmpeg_command(ffmpeg_path().unwrap())
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=30:size=640x480:rate=30")
+            .args(["-c:v", "libx264", "-preset", "ultrafast"])
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let out = dir.path().join("out");
+        let (mut planner, errors) = OutputPlanner::new([src.as_path()]);
+        assert!(errors.is_empty());
+        let plan = planner.plan(&src, Some(&out), "webm", false).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            convert(
+                &src,
+                plan,
+                Category::Video,
+                "webm",
+                &Options::default(),
+                &flag,
+            )
+        });
+        thread::sleep(Duration::from_millis(500));
+        cancel.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    }
+
+    #[test]
     fn media_via_ffmpeg() {
-        if !ffmpeg_available() {
+        if ffmpeg_path().is_none() {
             require_unset("CONVERTCRAFT_REQUIRE_FFMPEG", "ffmpeg is unavailable");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.mp4");
-        let ok = ffmpeg_command()
+        let ok = ffmpeg_command(ffmpeg_path().unwrap())
             .args([
                 "-y",
                 "-loglevel",

@@ -6,11 +6,13 @@ mod import;
 mod output;
 
 use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use converter::{Category, Options};
 use eframe::egui::{self, Color32, RichText};
@@ -18,6 +20,8 @@ use eframe::egui::{self, Color32, RichText};
 const APP_NAME: &str = "ConvertCraft";
 /// Import errors kept for the tooltip; the total is still counted.
 const MAX_REPORTED_ERRORS: usize = 50;
+/// How long closing the window waits for running jobs to stop.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn main() -> eframe::Result {
     let logo = image::load_from_memory(include_bytes!("../assets/logos/logo.png"))
@@ -110,8 +114,9 @@ struct App {
     files: Vec<FileItem>,
     out_dir: Option<PathBuf>,
     opts: Options,
-    ffmpeg: bool,
     rx: Option<Receiver<Msg>>,
+    cancel: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
     total: usize,
     finished: usize,
     import: Option<Import>,
@@ -120,13 +125,20 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, logo: egui::ColorImage) -> Self {
+        // Probing FFmpeg runs a process; keep it off the UI thread.
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            converter::ffmpeg_path();
+            repaint.request_repaint();
+        });
         Self {
             logo: ctx.load_texture("convertcraft-logo", logo, egui::TextureOptions::LINEAR),
             files: Vec::new(),
             out_dir: None,
             opts: Options::default(),
-            ffmpeg: converter::ffmpeg_available(),
             rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            workers: Vec::new(),
             total: 0,
             finished: 0,
             import: None,
@@ -277,7 +289,7 @@ impl App {
                 f.status = Status::Failed(format!("{error:#}"));
                 continue;
             }
-            if f.category.needs_ffmpeg() && !self.ffmpeg {
+            if f.category.needs_ffmpeg() && converter::ffmpeg_path().is_none() {
                 f.status = Status::Failed("ffmpeg not found on PATH".into());
                 continue;
             }
@@ -314,28 +326,49 @@ impl App {
         let workers = thread::available_parallelism()
             .map_or(2, |n| n.get())
             .min(4);
+        self.cancel = Arc::new(AtomicBool::new(false));
 
-        for _ in 0..workers {
-            let queue = Arc::clone(&queue);
-            let tx = tx.clone();
-            let ctx = ctx.clone();
-            let opts = self.opts.clone();
-            thread::spawn(move || {
-                loop {
-                    let Some(job) = queue.lock().unwrap().pop() else {
-                        break;
-                    };
-                    let _ = tx.send(Msg::Started(job.idx));
-                    ctx.request_repaint();
-                    let result =
-                        converter::convert(&job.input, job.output, job.category, job.target, &opts)
-                            .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(Msg::Finished(job.idx, result));
-                    ctx.request_repaint();
-                }
-            });
-        }
+        self.workers = (0..workers)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let tx = tx.clone();
+                let ctx = ctx.clone();
+                let opts = self.opts.clone();
+                let cancel = Arc::clone(&self.cancel);
+                thread::spawn(move || {
+                    while !cancel.load(Ordering::Relaxed) {
+                        let job = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
+                        let Some(job) = job else {
+                            break;
+                        };
+                        let _ = tx.send(Msg::Started(job.idx));
+                        ctx.request_repaint();
+                        let result = catch_panic(|| {
+                            converter::convert(
+                                &job.input,
+                                job.output,
+                                job.category,
+                                job.target,
+                                &opts,
+                                &cancel,
+                            )
+                        })
+                        .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(Msg::Finished(job.idx, result));
+                        ctx.request_repaint();
+                    }
+                })
+            })
+            .collect();
         self.rx = Some(rx);
+    }
+
+    /// Stop taking jobs and stop running FFmpeg processes.
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(import) = &self.import {
+            import.cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     fn poll(&mut self) {
@@ -352,7 +385,20 @@ impl App {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    // All workers are gone. Rows they never finished must not stay
+                    // "Pending" or "Converting" forever.
+                    let reason = if self.cancel.load(Ordering::Relaxed) {
+                        "cancelled"
+                    } else {
+                        "conversion did not finish"
+                    };
+                    for file in &mut self.files {
+                        if matches!(file.status, Status::Pending | Status::Running) {
+                            file.status = Status::Failed(reason.into());
+                        }
+                    }
                     self.rx = None;
+                    self.workers.clear();
                     break;
                 }
             }
@@ -367,14 +413,25 @@ impl App {
                 ui.label("Images, data, audio & video. Converted locally.");
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.ffmpeg {
-                    ui.label(RichText::new("ffmpeg ✔").color(Color32::from_rgb(90, 180, 110)))
-                        .on_hover_text("Audio and video conversion available");
-                } else {
-                    ui.label(
-                        RichText::new("ffmpeg missing").color(Color32::from_rgb(220, 160, 60)),
-                    )
-                    .on_hover_text("Install ffmpeg and add it to PATH to convert audio and video");
+                match converter::ffmpeg_status() {
+                    None => {
+                        ui.label(RichText::new("checking ffmpeg…").weak());
+                    }
+                    Some(Some(path)) => {
+                        ui.label(RichText::new("ffmpeg ✔").color(Color32::from_rgb(90, 180, 110)))
+                            .on_hover_text(format!(
+                                "Audio and video conversion available\n{}",
+                                display_path(path).display()
+                            ));
+                    }
+                    Some(None) => {
+                        ui.label(
+                            RichText::new("ffmpeg missing").color(Color32::from_rgb(220, 160, 60)),
+                        )
+                        .on_hover_text(
+                            "Install ffmpeg and add its folder to PATH to convert audio and video",
+                        );
+                    }
                 }
             });
         });
@@ -449,11 +506,24 @@ impl App {
                 .count();
             let button = egui::Button::new(RichText::new("Convert").size(16.0).strong())
                 .min_size(egui::vec2(120.0, 32.0));
+            // Wait for the FFmpeg check so media rows are not failed prematurely.
+            let ready = converter::ffmpeg_status().is_some();
             if ui
-                .add_enabled(!self.busy() && pending > 0, button)
+                .add_enabled(!self.busy() && ready && pending > 0, button)
                 .clicked()
             {
                 self.start(ui.ctx());
+            }
+            if self.running()
+                && ui
+                    .add_enabled(
+                        !self.cancel.load(Ordering::Relaxed),
+                        egui::Button::new("Cancel"),
+                    )
+                    .on_hover_text("Stop after the jobs already running; FFmpeg jobs stop at once")
+                    .clicked()
+            {
+                self.cancel();
             }
             if self.total > 0 {
                 let fraction = self.finished as f32 / self.total as f32;
@@ -563,14 +633,15 @@ impl App {
                                     });
                                 }
                                 Status::Done(out) => {
-                                    let link =
-                                        ui.link(
+                                    let link = ui
+                                        .link(
                                             RichText::new("Done")
                                                 .color(Color32::from_rgb(90, 180, 110)),
                                         )
-                                        .on_hover_text(
-                                            format!("{}\nClick to show in folder", out.display()),
-                                        );
+                                        .on_hover_text(format!(
+                                            "{}\nClick to show in folder",
+                                            display_path(out).display()
+                                        ));
                                     if link.clicked() {
                                         reveal(out);
                                     }
@@ -643,21 +714,99 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_bar(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.file_list(ui));
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Let workers stop FFmpeg and clean up their staging files before the
+        // process exits; image/data jobs cannot be interrupted, so wait briefly.
+        self.cancel();
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while self.workers.iter().any(|w| !w.is_finished()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Turn a panic inside a conversion into an ordinary per-file error.
+fn catch_panic<T>(f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        Err(anyhow::anyhow!("internal error: {message}"))
+    })
+}
+
+/// Drop the `\\?\` prefix that `canonicalize` adds on Windows when the plain form
+/// names the same file, for display and for Explorer (which does not accept it).
+fn display_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str() {
+        // Plain paths of MAX_PATH length or more need the prefix.
+        if text.len() < 260 {
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{rest}"));
+            }
+            if let Some(rest) = text.strip_prefix(r"\\?\")
+                && rest.as_bytes().get(1) == Some(&b':')
+            {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Open the system file manager with the converted file selected.
 fn reveal(path: &Path) {
     #[cfg(windows)]
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{}", path.display()))
-        .spawn();
+    {
+        use std::os::windows::process::CommandExt;
+        // Absolute path: Windows would otherwise look next to this executable first.
+        let windows = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        // Explorer splits arguments on commas; quote the path (it cannot contain `"`).
+        let _ = std::process::Command::new(windows.join("explorer.exe"))
+            .raw_arg(format!("/select,\"{}\"", display_path(path).display()))
+            .spawn();
+    }
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open")
+    let _ = std::process::Command::new("/usr/bin/open")
         .arg("-R")
         .arg(path)
         .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     if let Some(dir) = path.parent() {
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panics_become_errors() {
+        let error =
+            catch_panic(|| -> anyhow::Result<()> { panic!("decoder exploded") }).unwrap_err();
+        assert_eq!(error.to_string(), "internal error: decoder exploded");
+        assert_eq!(catch_panic(|| Ok(7)).unwrap(), 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefixes_are_hidden_when_safe() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\a.png")),
+            Path::new(r"C:\Users\a.png")
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\a.png")),
+            Path::new(r"\\server\share\a.png")
+        );
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(display_path(Path::new(&long)), Path::new(&long));
+        assert_eq!(display_path(Path::new(r"C:\plain")), Path::new(r"C:\plain"));
     }
 }

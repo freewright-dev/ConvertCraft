@@ -12,6 +12,7 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Added
 
+- **Cancel** button for running batches; FFmpeg jobs stop immediately (#22, #23).
 - CI workflow: rustfmt, Clippy with `-D warnings`, tests on Linux/Windows/macOS with FFmpeg, and `cargo deny check` with a committed `deny.toml` policy (#20).
 - `#![forbid(unsafe_code)]` at the crate root.
 - `CONVERTCRAFT_REQUIRE_FFMPEG` / `CONVERTCRAFT_REQUIRE_SYMLINKS` test switches that turn skipped media/symlink tests into failures.
@@ -30,6 +31,11 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Fixed
 
+- A panic during a conversion fails only that row, and rows left unfinished by exiting workers are marked failed instead of staying "Converting…" forever. Closing the window stops FFmpeg and waits briefly for workers to clean up their staging files (#22).
+- FFmpeg runs with a demuxer whitelist (no HLS/ffconcat playlists), `-protocol_whitelist file`, and `-nostdin`; a job with no progress for 5 minutes is stopped; stderr capture is capped at 64 KiB (#23).
+- FFmpeg is located only in absolute `PATH` entries, and Explorer is launched by absolute path, so executables placed next to ConvertCraft are not run (#19).
+- Output paths are shown and passed to Explorer without the `\\?\` prefix, and the Explorer argument is quoted so names containing commas select the right file (#25).
+- The FFmpeg availability check runs on a background thread instead of blocking startup (#24).
 - Batches no longer keep two open handles per queued job: source and destination identities are stored as keys, so large batches no longer run into the Unix open-file limit (#17).
 - A missing, unreadable, or non-regular source fails only its own row instead of the whole batch; completed rows whose sources were deleted no longer block new conversions (#16).
 - File systems that report no file ID are detected, and overwrite then uses a numbered name instead of replacing a file it cannot re-identify (#26).

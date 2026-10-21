@@ -71,7 +71,7 @@ ffmpeg -version
 
 For example, use `sudo apt-get install ffmpeg` on Debian/Ubuntu or `brew install ffmpeg` on macOS with Homebrew. On Windows, add the directory containing `ffmpeg.exe` to `PATH`.
 
-The header shows **ffmpeg ✔** when available or **ffmpeg missing** otherwise. Restart ConvertCraft after installing FFmpeg or changing `PATH`: availability is checked at startup. Available encoders depend on your FFmpeg build.
+The header shows **checking ffmpeg…** briefly, then **ffmpeg ✔** (hover for the path in use) or **ffmpeg missing**. Only absolute `PATH` entries are searched, never ConvertCraft's own folder. Restart ConvertCraft after installing FFmpeg or changing `PATH`: availability is checked at startup. Available encoders depend on your FFmpeg build.
 
 ## Convert a batch
 
@@ -100,7 +100,7 @@ Targets are restricted to each category. Extension recognition is case-insensiti
 - **Images are not archival copies.** JPEG discards transparency. ICO output fits within 256×256. Image conversion does not preserve all animation frames, metadata, or original bit depth.
 - **Data conversion can change representation.** Comments and formatting are lost. CSV infers scalar types, so `00123` can become `123`. TOML rejects nulls and wraps non-object roots under `items`. See [data compatibility](docs/formats.md#structured-data).
 - **Media is re-encoded.** Fixed presets determine quality and codec selection; there are no bitrate, trimming, subtitle, or stream-selection controls.
-- **Sessions are temporary.** Settings and the queue are not saved. There is no cancellation control.
+- **Sessions are temporary.** Settings and the queue are not saved. A running batch can be cancelled; image and data jobs already in progress finish first.
 
 ## Development
 
