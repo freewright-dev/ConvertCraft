@@ -63,6 +63,8 @@ Run `ffmpeg -version` in the launch environment and restart ConvertCraft. A succ
 
 Category selection uses the filename extension, not content inspection. Check the [recognized extensions](formats.md) and make sure the contents match a supported format. Renaming an extension alone does not convert a file.
 
+Images are decoded according to their contents. `unsupported image format` means the file is really a format ConvertCraft does not read (for example OpenEXR saved as `.png`). `image is too large to convert` means it exceeds the 100-megapixel limit.
+
 ### TOML or CSV conversion fails or changes values
 
 TOML cannot represent null values. CSV output requires an object or an array of objects. CSV input infers numbers and booleans, treats empty fields as null, and can lose leading zeroes in identifiers. See the [data rules](formats.md#structured-data).

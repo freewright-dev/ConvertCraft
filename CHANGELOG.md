@@ -30,6 +30,8 @@ This changelog records the current implementation. `Cargo.toml` declares version
 
 ### Fixed
 
+- Images over 100 megapixels are rejected before decoding, and concurrent image jobs share a 1.5 GiB memory budget; a 260 KB PNG could previously drive one conversion to 1.35 GB of memory and a 1 GiB output (#14).
+- Only the advertised image input formats are decoded. The `image` crate is built without its EXR, HDR, DDS, farbfeld, and AVIF support, and files sniffed as other formats are rejected (#21).
 - Enforce no-clobber when publishing new outputs, including files created after planning and case-only name collisions.
 - Preserve existing destinations when image/data encoding or FFmpeg fails; publish successful conversions from owned staging files.
 - Protect all queued source paths and file identities from overwrite-enabled batch outputs.
