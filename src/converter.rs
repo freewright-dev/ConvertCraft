@@ -341,10 +341,12 @@ fn convert_data(
             de.end().context("invalid JSON")?;
             value
         }
-        "yaml" => budget
-            .seed()
-            .deserialize(serde_yaml::Deserializer::from_str(&text))
-            .context("invalid YAML")?,
+        "yaml" => {
+            serde_saphyr::with_deserializer_from_str_with_options(&text, yaml_options(), |de| {
+                budget.seed().deserialize(de)
+            })
+            .context("invalid YAML")?
+        }
         "toml" => budget
             .seed()
             .deserialize(toml::Deserializer::new(&text))
@@ -363,7 +365,7 @@ fn convert_data(
             serde_json::to_writer_pretty(&mut writer, &value)?;
             writer.write_all(b"\n")?;
         }
-        "yaml" => serde_yaml::to_writer(&mut writer, &value)?,
+        "yaml" => serde_saphyr::to_io_writer(&mut writer, &value)?,
         "toml" => {
             // TOML documents must be a table at the top level.
             let value = match value {
@@ -379,6 +381,29 @@ fn convert_data(
     }
     writer.flush().context("cannot flush data output")?;
     Ok(())
+}
+
+/// The parser's own defaults are sized for configuration files. Data files up to
+/// `MAX_DATA_INPUT_BYTES` may hold millions of nodes, and alias expansion is already
+/// charged to the `ValueBudget`, so only the structural limits are kept.
+fn yaml_options() -> serde_saphyr::Options {
+    let nodes = (MAX_DATA_VALUE_BYTES / VALUE_NODE_BYTES) as usize;
+    let mut options = serde_saphyr::Options::default();
+    let mut budget = serde_saphyr::Budget::default();
+    budget.max_events = 2 * nodes;
+    budget.max_nodes = nodes;
+    budget.max_aliases = nodes;
+    budget.max_anchors = nodes;
+    // Same nesting limit as serde_json.
+    budget.max_depth = 128;
+    // Many aliases of one anchor (`<<: *defaults`) are ordinary YAML.
+    budget.enforce_alias_anchor_ratio = false;
+    options.budget = Some(budget);
+    options.alias_limits.max_total_replayed_events = 2 * nodes;
+    options.alias_limits.max_replay_stack_depth = 128;
+    // Row errors are tooltips; keep them to the message and location.
+    options.with_snippet = false;
+    options
 }
 
 /// Estimated memory charged while a document is built.
@@ -1021,22 +1046,37 @@ mod tests {
     }
 
     #[test]
+    fn yaml_round_trip_keeps_ambiguous_scalars() {
+        let original = serde_json::json!({
+            "strings": ["yes", "no", "null", "~", "true", "0x1F", "010", "1e3", ".inf",
+                "", " padded ", "a: b", "- item", "#hash", "multi\nline", "*alias", "&anchor"],
+            "numbers": [0, -7, 18446744073709551615u64, 0.5, 1e300],
+            "nested": {"empty_list": [], "empty_map": {}, "null": null, "bool": false},
+        });
+        let opts = Options::default();
+        let yaml = convert_text("in.json", &original.to_string(), "yaml", &opts).unwrap();
+        let json = convert_text("in.yaml", &yaml, "json", &opts).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&json).unwrap(),
+            original,
+            "{yaml}"
+        );
+    }
+
+    #[test]
     fn yaml_alias_expansion_is_budgeted() {
         let mut yaml = format!("anchor: &s {}\nrefs: [", "x".repeat(4096));
         yaml.push_str(&vec!["*s"; 1000].join(","));
         yaml.push_str("]\n");
-        let budget = ValueBudget::new(1024 * 1024);
-        let error = budget
-            .seed()
-            .deserialize(serde_yaml::Deserializer::from_str(&yaml))
-            .unwrap_err();
+        let parse = |budget: ValueBudget| {
+            serde_saphyr::with_deserializer_from_str_with_options(&yaml, yaml_options(), |de| {
+                budget.seed().deserialize(de)
+            })
+        };
+        let error = parse(ValueBudget::new(1024 * 1024)).unwrap_err();
         assert!(error.to_string().contains("memory limit"), "{error}");
         // The same document fits a budget large enough for its ~4 MB expansion.
-        let budget = ValueBudget::new(8 * 1024 * 1024);
-        let value = budget
-            .seed()
-            .deserialize(serde_yaml::Deserializer::from_str(&yaml))
-            .unwrap();
+        let value = parse(ValueBudget::new(8 * 1024 * 1024)).unwrap();
         assert_eq!(value["refs"].as_array().unwrap().len(), 1000);
     }
 

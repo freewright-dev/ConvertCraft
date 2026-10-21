@@ -26,7 +26,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libgl1-mesa-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
     strategy:
@@ -51,7 +51,7 @@ jobs:
         run: choco install ffmpeg --no-progress -y
       - run: ffmpeg -version
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+      - run: cargo test --locked --workspace
 
   deny:
     runs-on: ubuntu-latest
