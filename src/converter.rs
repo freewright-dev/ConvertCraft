@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread;
@@ -695,6 +695,30 @@ fn locate_ffmpeg() -> Option<PathBuf> {
     works.then_some(ffmpeg)
 }
 
+/// Stop FFmpeg and anything it started. Package managers such as Chocolatey put a
+/// shim `ffmpeg.exe` on PATH that runs the real one as a child; killing only the shim
+/// would leave the real encoder running and holding the staged output open.
+fn kill_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let windows = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        // Must run while the parent is alive: /T finds children through it.
+        let _ = Command::new(windows.join("System32").join("taskkill.exe"))
+            .args(["/T", "/F", "/PID"])
+            .arg(child.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[cfg(windows)]
 fn ffmpeg_command(ffmpeg: &Path) -> Command {
     use std::os::windows::process::CommandExt;
@@ -842,8 +866,7 @@ fn convert_media(input: &Path, output: &Path, target: &str, cancel: &AtomicBool)
     let status = match stopped {
         Ok(status) => status,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return Err(error);
         }
     };
