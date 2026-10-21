@@ -12,47 +12,61 @@ use tempfile::{NamedTempFile, TempDir};
 
 const MAX_NAME_ATTEMPTS: usize = 10_000;
 
-/// File identity (volume + file ID) read once, without keeping the file open, so a
-/// batch holds no descriptors per queued job.
+/// File identity read once, without keeping the file open, so a batch holds no
+/// descriptors per queued job.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FileKey {
     volume: u64,
     index: u64,
+    /// Unix inode change time in nanoseconds (0 on Windows). Without an open handle an
+    /// inode number can be reused by a new file right after deletion; the new file has
+    /// a fresh change time. NTFS file indexes already carry a reuse sequence number.
+    changed: i64,
 }
 
 impl FileKey {
     /// `None` when the file system reports no usable file ID (some network and FAT
     /// redirectors report 0); identity checks then fail safe.
-    fn new(volume: u64, index: u64) -> Option<Self> {
-        (index != 0).then_some(Self { volume, index })
+    fn new(volume: u64, index: u64, changed: i64) -> Option<Self> {
+        (index != 0).then_some(Self {
+            volume,
+            index,
+            changed,
+        })
+    }
+
+    #[cfg(unix)]
+    fn from_metadata(metadata: &Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let changed = metadata
+            .ctime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(metadata.ctime_nsec());
+        Self::new(metadata.dev(), metadata.ino(), changed)
     }
 
     fn of_path(path: &Path) -> io::Result<Option<Self>> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = fs::metadata(path)?;
-            Ok(Self::new(metadata.dev(), metadata.ino()))
+            Ok(Self::from_metadata(&fs::metadata(path)?))
         }
         #[cfg(windows)]
         {
             let handle = winapi_util::Handle::from_path_any(path)?;
             let info = winapi_util::file::information(&handle)?;
-            Ok(Self::new(info.volume_serial_number(), info.file_index()))
+            Ok(Self::new(info.volume_serial_number(), info.file_index(), 0))
         }
     }
 
     fn of_file(file: &File) -> io::Result<Option<Self>> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = file.metadata()?;
-            Ok(Self::new(metadata.dev(), metadata.ino()))
+            Ok(Self::from_metadata(&file.metadata()?))
         }
         #[cfg(windows)]
         {
             let info = winapi_util::file::information(winapi_util::HandleRef::from_file(file))?;
-            Ok(Self::new(info.volume_serial_number(), info.file_index()))
+            Ok(Self::new(info.volume_serial_number(), info.file_index(), 0))
         }
     }
 }
@@ -404,8 +418,8 @@ mod tests {
 
     #[test]
     fn unknown_file_ids_never_compare_equal() {
-        assert_eq!(FileKey::new(7, 0), None);
-        let key = FileKey::new(7, 42);
+        assert_eq!(FileKey::new(7, 0, 0), None);
+        let key = FileKey::new(7, 42, 0);
         assert!(same_file(key, key));
         assert!(!same_file(None, None));
         assert!(!same_file(key, None));
@@ -444,6 +458,20 @@ mod tests {
         assert!(plan.open_source(&input).is_ok());
         let moved = dir.path().join("moved.json");
         fs::rename(&input, &moved).unwrap();
+        fs::write(&input, b"swapped").unwrap();
+        let error = plan.open_source(&input).unwrap_err();
+        assert!(format!("{error:#}").contains("source changed"), "{error:#}");
+    }
+
+    #[test]
+    fn source_deleted_and_recreated_after_planning_is_not_read() {
+        // Unix file systems may give the new file the deleted file's inode number.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.json");
+        fs::write(&input, b"original").unwrap();
+        let mut planner = protect_all([input.as_path()]);
+        let plan = planner.plan(&input, None, "yaml", false).unwrap();
+        fs::remove_file(&input).unwrap();
         fs::write(&input, b"swapped").unwrap();
         let error = plan.open_source(&input).unwrap_err();
         assert!(format!("{error:#}").contains("source changed"), "{error:#}");
