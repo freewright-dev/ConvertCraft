@@ -110,7 +110,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-The existing tests exercise image targets, structured data round trips, output-path collisions, and media conversions. **The media test skips itself when FFmpeg is absent**; install it with the required encoders to exercise that path.
+The existing tests exercise image targets, structured data round trips, output-path collisions, and media conversions. **The media test skips itself when FFmpeg is absent**; install it with the required encoders to exercise that path, or set `CONVERTCRAFT_REQUIRE_FFMPEG=1` to make a missing FFmpeg fail the test. CI runs formatting, Clippy, tests on Linux/Windows/macOS, and `cargo deny check` (see [development docs](docs/development.md#continuous-integration)).
 
 | Path | Responsibility |
 | --- | --- |

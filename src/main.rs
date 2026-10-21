@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![forbid(unsafe_code)]
 
 mod converter;
 mod output;
@@ -249,15 +250,15 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(!self.running(), |ui| {
-                if ui.button("➕ Add files…").clicked() {
-                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                        paths.into_iter().for_each(|p| self.add_path(p));
-                    }
+                if ui.button("➕ Add files…").clicked()
+                    && let Some(paths) = rfd::FileDialog::new().pick_files()
+                {
+                    paths.into_iter().for_each(|p| self.add_path(p));
                 }
-                if ui.button("📁 Add folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.add_path(dir);
-                    }
+                if ui.button("📁 Add folder…").clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.add_path(dir);
                 }
                 if ui.button("Clear finished").clicked() {
                     self.files.retain(|f| !matches!(f.status, Status::Done(_)));
@@ -285,10 +286,10 @@ impl App {
                     Some(dir) => format!("Folder: {}", dir.display()),
                     None => "Choose folder…".to_string(),
                 };
-                if ui.radio(self.out_dir.is_some(), label).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.out_dir = Some(dir);
-                    }
+                if ui.radio(self.out_dir.is_some(), label).clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.out_dir = Some(dir);
                 }
             });
             ui.horizontal(|ui| {
@@ -339,10 +340,10 @@ impl App {
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
             });
-            if response.inner.clicked() {
-                if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                    paths.into_iter().for_each(|p| self.add_path(p));
-                }
+            if response.inner.clicked()
+                && let Some(paths) = rfd::FileDialog::new().pick_files()
+            {
+                paths.into_iter().for_each(|p| self.add_path(p));
             }
             return;
         }

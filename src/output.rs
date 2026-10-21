@@ -467,6 +467,11 @@ mod tests {
         if let Err(error) = result {
             #[cfg(windows)]
             if error.raw_os_error() == Some(1314) {
+                // CI sets this so a missing privilege fails instead of skipping.
+                assert!(
+                    std::env::var_os("CONVERTCRAFT_REQUIRE_SYMLINKS").is_none(),
+                    "CONVERTCRAFT_REQUIRE_SYMLINKS is set but symlink creation is not permitted"
+                );
                 eprintln!("symlink test requires Windows Developer Mode or symlink privilege");
                 return false;
             }
