@@ -54,7 +54,7 @@ The progress bar counts finished jobs, including failures; it is not a byte-leve
 - **Clear all** removes all rows and resets the import summary without deleting files.
 - The row's **✖** removes that entry without deleting its source or output.
 
-To reconvert a completed source, remove its row and add it again. Changing a completed row's target alone does not schedule another conversion. There is no cancel control, settings persistence, or saved queue.
+To reconvert a completed source, remove its row and add it again. Changing a completed row's target alone does not schedule another conversion. Click **Cancel** next to **Convert** to stop a running batch: no new jobs start, FFmpeg jobs stop immediately, image and data jobs already running finish, and unfinished rows are marked `cancelled`. Closing the window during a batch cancels it the same way. There is no settings persistence or saved queue.
 
 ## Troubleshooting
 

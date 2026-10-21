@@ -40,13 +40,13 @@ The project is a single binary crate with internal `converter` and `output` modu
 
 ### Import and state
 
-`App` holds queued `FileItem`s, output directory, conversion `Options`, startup FFmpeg availability, worker message receiver, counters, the running import (if any), and the import summary. A `FileItem` contains its path, detected `Category`, target, and `Status`.
+`App` holds queued `FileItem`s, output directory, conversion `Options`, worker message receiver, batch cancel flag and worker join handles, counters, the running import (if any), and the import summary. A `FileItem` contains its path, detected `Category`, target, and `Status`.
 
 `App::add_paths` starts `import::scan` on a background thread and receives its events over a channel; `poll_import` drains them each frame. The scan (`src/import.rs`) is an iterative depth-first walk in sorted order. Picked roots are followed even when they are links; links found inside folders (`FileType::is_symlink`, which on Windows covers symlinks and junctions but not cloud-file placeholders) are reported and skipped. `import::Limits` bounds depth (64), files (100,000), and folders (20,000). Unsupported extensions, skipped links, too-deep folders, read errors, and special files are reported as events and shown in the top-bar summary. Exact-path duplicates are dropped with a `HashSet`; paths are not canonicalized.
 
 ### Planning
 
-`App::start` first constructs an `OutputPlanner` protecting all queued inputs, including completed rows. It ignores completed rows for conversion and marks media rows failed when FFmpeg was unavailable at startup. For each remaining row, the planner chooses a source-adjacent or custom-directory path, adding numbered suffixes when needed, up to 10,000 attempts per job.
+`App::start` first constructs an `OutputPlanner` protecting all queued inputs, including completed rows. It ignores completed rows for conversion and marks media rows failed when FFmpeg was not found. FFmpeg is located once on a background thread at startup (`converter::ffmpeg_path`); **Convert** stays disabled until that check finishes. For each remaining row, the planner chooses a source-adjacent or custom-directory path, adding numbered suffixes when needed, up to 10,000 attempts per job.
 
 The planner resolves parent directories, conservatively case-folds reserved names, and records each source's `FileKey` (device and inode on Unix; volume serial and file index on Windows). Keys are read and the file closed immediately, so a batch holds no open file per queued job. It protects input paths and hard-link identities, skips destination links/reparse points and special files, and records the key of any existing file selected for replacement.
 
@@ -64,7 +64,7 @@ Each worker sends `Started(index)` and `Finished(index, result)` through an MPSC
 
 `Status` transitions are normally `Pending` → `Running` → `Done(output)` or `Failed(error)`. Failed rows can be rescheduled; completed rows remain excluded even if their target changes. Queue mutations are disabled during execution so message indices remain valid.
 
-There are no cancellation tokens, explicit worker join handles, per-file progress callbacks, or custom shutdown coordination. Panics inside workers are not translated into normal per-file errors.
+Each batch has a cancel flag. **Cancel** sets it: workers stop taking jobs, running FFmpeg processes are killed within about 100 ms, and image/data jobs already running finish normally. Rows that never finished are marked `cancelled` (or `conversion did not finish` if workers exited for another reason) when the channel disconnects. A panic inside a conversion is caught with `catch_unwind` and reported as that row's `internal error`. Closing the window cancels the batch and waits up to 5 seconds for workers, so FFmpeg is stopped and staging files are cleaned up; an image or data job still running after that may leave a staging directory behind. There are no per-file progress callbacks.
 
 ### Backend dispatch
 
@@ -110,4 +110,4 @@ For a new recognized input extension, update `detect` and, if needed, `normalize
 
 Add tests for conversion and expected losses or failure cases, then update [formats.md](formats.md), the [README](../README.md), and [CHANGELOG.md](../CHANGELOG.md). Keep display branding consistent with `main.rs` and package naming consistent with `Cargo.toml`.
 
-Further reliability work includes descriptor-relative operations in hostile directories, conversion resource limits, and worker panic/shutdown handling.
+Further reliability work includes descriptor-relative operations in hostile directories and moving output planning off the UI thread.

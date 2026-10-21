@@ -117,9 +117,17 @@ These presets re-encode rather than requesting stream copying. There are no UI c
 The backend executes the equivalent of:
 
 ```text
-ffmpeg -y -hide_banner -loglevel error -i INPUT [target preset arguments] STAGED_OUTPUT
+ffmpeg -y -nostdin -hide_banner -loglevel error -progress pipe:1 \
+       -protocol_whitelist file -format_whitelist DEMUXERS \
+       -i INPUT [target preset arguments] STAGED_OUTPUT
 ```
 
 Paths and options are passed as separate process arguments, not interpolated into a shell command. On Windows the subprocess uses `CREATE_NO_WINDOW`.
+
+FFmpeg is the first `ffmpeg` (`ffmpeg.exe` on Windows) found in an **absolute** `PATH` entry that runs `-version` successfully. Relative `PATH` entries are skipped, and, unlike a plain process launch on Windows, the application's own folder is not searched, so an `ffmpeg.exe` placed next to ConvertCraft is never run implicitly.
+
+`DEMUXERS` is `aac,aiff,asf,avi,flac,flv,matroska,mov,mp3,mpeg,mpegts,ogg,wav`, which covers every recognized audio/video input extension. Playlist and concatenation formats (HLS, ffconcat) are not on the list, so a "video" that is really a playlist cannot pull other local files into the output. Only the `file` protocol is allowed for input.
+
+Jobs can be cancelled from the UI. A job is also stopped if FFmpeg reports no progress for 5 minutes. Only the last 64 KiB of FFmpeg's error output is kept.
 
 The `-y` flag permits FFmpeg to write only its owned temporary output, whose suffix matches the target format. On nonzero exit, the backend reports the last nonempty stderr line and staging is cleaned up. The final destination is published after success through the same no-clobber/replacement policy as image and data conversions; failed input parsing does not delete an old destination.
