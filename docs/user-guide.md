@@ -18,9 +18,11 @@ For audio/video support, install FFmpeg with the codecs listed in the [format re
 - **Add folder…** recursively visits the selected directory.
 - Drag files or folders onto the window, or click the empty drop area to browse.
 
-Directory entries are sorted before recursive processing. Files with unrecognized extensions are skipped, and a skipped-file count is shown alongside category controls when the queue is nonempty. Adding an identical path already in the queue has no effect. Paths are not canonicalized, so alternate paths to the same file are not reliably deduplicated.
+Imports run in the background: the top bar shows **Scanning… N files found** with a **Cancel** button, and queue controls and **Convert** are disabled until the scan finishes. Directory entries are visited in sorted order. Files with unrecognized extensions are skipped. Adding an identical path already in the queue has no effect. Paths are not canonicalized, so alternate paths to the same file are not reliably deduplicated.
 
-Folder traversal follows paths reported as directories; it has no explicit symlink-cycle protection. Avoid importing directory trees with cyclic directory links. Unreadable directories or entries may be silently omitted.
+Symbolic links and junctions **inside** a folder are not followed, so link cycles cannot hang the import and links cannot pull in files from elsewhere. A folder or file you pick or drop yourself is used even if it is a link. Folders nested more than 64 levels deep are skipped, and a single import stops after 100,000 files or 20,000 folders. Special files (devices, pipes, sockets) are reported as errors instead of being queued.
+
+After an import, the top bar summarizes what was not queued: unsupported files, links not followed, folders nested too deeply, a stop message if a limit was hit, and the number of import errors. Hover the error count to see the affected paths.
 
 ## Select targets and options
 
@@ -49,7 +51,7 @@ Statuses are **Pending**, **Converting…**, **Done**, or **Failed**. Hover over
 The progress bar counts finished jobs, including failures; it is not a byte-level or per-file encoding progress indicator. Media entries rejected because FFmpeg is missing are not included in the scheduled-job count.
 
 - **Clear finished** removes successful rows without deleting files.
-- **Clear all** removes all rows and resets the skipped-file count without deleting files.
+- **Clear all** removes all rows and resets the import summary without deleting files.
 - The row's **✖** removes that entry without deleting its source or output.
 
 To reconvert a completed source, remove its row and add it again. Changing a completed row's target alone does not schedule another conversion. There is no cancel control, settings persistence, or saved queue.
